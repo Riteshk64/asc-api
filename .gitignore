@@ -6,4 +6,6 @@
 .env
 instance/
 *.log
+*.db
+migrations/
 .vscode/
