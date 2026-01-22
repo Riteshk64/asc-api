@@ -1,0 +1,9 @@
+/ase
+/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+instance/
+*.log
+.vscode/
