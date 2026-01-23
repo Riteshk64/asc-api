@@ -23,12 +23,12 @@ def create_app():
     app.register_blueprint(analytics)
     app.register_blueprint(core)
 
-    # phase 1
+    # Logging and error handling
     setup_logging(app)
     register_error_handlers(app)
 
     @app.route("/")
     def health_check():
-        return "API working!"
+        return {'key': 'value'}
 
     return app
