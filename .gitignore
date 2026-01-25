@@ -1,11 +1,37 @@
-/ase
-/__pycache__
+# Python
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Virtual environment
+ase/
+
+# Environment variables
 .env
-instance/
-*.log
+.env.*
+
+# Databases
+app.db
 *.db
+*.sqlite
+*.sqlite3
 migrations/
+
+# Firebase secrets & logs
+firebase-service-account.json
+.firebase/
+firebase-debug.log
+ui-debug.log
+
+# Logs
+*.log
+
+# IDE
 .vscode/
+
+# OS
+.DS_Store
+
+# Flask
+instance/
