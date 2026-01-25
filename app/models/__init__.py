@@ -1,4 +1,4 @@
-from .departments import Department
+from .departments import Departments
 from .user import User
 from .supplier import Supplier
 from .contractor import Contractor
