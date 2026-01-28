@@ -58,11 +58,13 @@ def create_profile():
     phone = decoded.get("phone")
 
     data = request.get_json()
-    name = data.get("name")
+    first_name = data.get("first_name")
+    last_name = data.get("last_name")
     department_id = data.get("department_id")
 
     user = User(
-        name=name,
+        first_name=first_name,
+        last_name=last_name,
         phoneno=phone,
         role="USER",
         department_id=department_id,
