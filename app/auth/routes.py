@@ -17,6 +17,7 @@ def verify_phone():
         return jsonify({"success": False, "message": "Token required"}), 400
 
     decoded = verify_firebase_token(firebase_token)
+    print(decoded)
     phone = decoded.get("phone_number")
 
     user = User.query.filter_by(phoneno=phone).first()  # phone as identity
@@ -85,6 +86,6 @@ def create_profile():
 
     return jsonify({"token": token})
 
-@auth.route("/test", methods=["POST"])
+@auth.route("/test")
 def test():
     return jsonify({"message": "Auth route is working!"})
