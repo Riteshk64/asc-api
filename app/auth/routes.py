@@ -84,3 +84,7 @@ def create_profile():
     )
 
     return jsonify({"token": token})
+
+@auth.route("/test", methods=["POST"])
+def test():
+    return jsonify({"message": "Auth route is working!"})
