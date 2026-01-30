@@ -19,7 +19,7 @@ def jwt_required(fn):
             payload = jwt.decode(
                 token,
                 current_app.config["SECRET_KEY"],
-                algorithms=[ os.getenv("ALGORITHM") ],
+                algorithms=['HS256'],
             )
         except jwt.ExpiredSignatureError:
             return jsonify({"message": "Token expired"}), 401
