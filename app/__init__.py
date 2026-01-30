@@ -1,4 +1,5 @@
 from flask import Flask
+from flask_cors import CORS
 
 from .extensions import db, migrate
 from .config import Config
@@ -17,6 +18,21 @@ def create_app():
     # init extensions
     db.init_app(app)
     migrate.init_app(app, db)
+
+
+    CORS(app)
+
+
+    #import models
+    from app.models.product import Product
+    from app.models.department import Department
+    from app.models.user import User
+    from app.models.contractor import Contractor
+    from app.models.activity_log import ActivityLog
+    from app.models.transaction import Transaction
+    from app.models.supplier import Supplier
+
+
 
     with app.app_context():
         from app import models

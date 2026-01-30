@@ -1,5 +1,6 @@
-# Python
-__pycache__/
+/ase
+/venv
+/__pycache__
 *.pyc
 *.pyo
 *.pyd
