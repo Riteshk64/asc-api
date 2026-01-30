@@ -1,4 +1,5 @@
 /ase
+/venv
 /__pycache__
 *.pyc
 *.pyo
