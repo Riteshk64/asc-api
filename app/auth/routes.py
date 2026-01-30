@@ -1,3 +1,4 @@
+import os
 from flask import Blueprint, request, jsonify
 from app.auth.firebase import verify_firebase_token
 from app.auth.jwt_utils import generate_jwt
@@ -53,7 +54,7 @@ def create_profile():
     decoded = jwt.decode(
         token,
         current_app.config["SECRET_KEY"],
-        algorithms=["HS256"]
+        algorithms=[ os.getenv("ALGORITHM") ],
     )
 
     phone = decoded.get("phone")
