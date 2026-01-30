@@ -54,7 +54,7 @@ def create_profile():
     decoded = jwt.decode(
         token,
         current_app.config["SECRET_KEY"],
-        algorithms=[ os.getenv("ALGORITHM") ],
+        algorithms=['HS256'],
     )
 
     phone = decoded.get("phone")
