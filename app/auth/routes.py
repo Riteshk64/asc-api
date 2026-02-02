@@ -18,33 +18,41 @@ def verify_phone():
         return jsonify({"success": False, "message": "Token required"}), 400
 
     decoded = verify_firebase_token(firebase_token)
-    print(decoded)
     phone = decoded.get("phone_number")
 
-    user = User.query.filter_by(phoneno=phone).first()  # phone as identity
+    if not phone:
+        return jsonify({"success": False, "message": "Invalid Firebase token"}), 400
+
+    user = User.query.filter_by(phoneno=phone).first()
 
     if user:
         token = generate_jwt(
-        {
-            "user_id": user.id,
-            "role": user.role,
-            "department_id": user.department_id,
-            "profile_complete": True
-        },
-        expires_in_minutes=60 * 24 * 7
-    )
-        return jsonify({"token": token})
+            {
+                "user_id": user.id,
+                "role": user.role,
+                "department_id": user.department_id,
+                "profile_complete": True
+            },
+            expires_in_minutes=60 * 24 * 7
+        )
 
-    # New user → temporary JWT
-    temp_token = generate_jwt({
-        "phone": phone,
-        "profile_complete": False
-    }, expires_in_minutes=15)
+        return jsonify({
+            "token": token,
+            "profile_complete": True
+        }), 200
+
+    temp_token = generate_jwt(
+        {
+            "phone": phone,
+            "profile_complete": False
+        },
+        expires_in_minutes=15
+    )
 
     return jsonify({
         "token": temp_token,
         "profile_complete": False
-    })
+    }), 200
 
 @auth.route("/create-profile", methods=["POST"])
 def create_profile():
