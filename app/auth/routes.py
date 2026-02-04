@@ -22,7 +22,9 @@ def verify_phone():
     except Exception as e:
         return jsonify({"success": False, "message": "Invalid Firebase Token"}), 401
 
-    # Check if user exists
+    if not phone:
+        return jsonify({"success": False, "message": "No number provided"}), 400
+
     user = User.query.filter_by(phoneno=phone).first()
 
     if user:
@@ -35,18 +37,24 @@ def verify_phone():
             },
             expires_in_minutes=60 * 24 * 7
         )
-        return jsonify({"token": token, "profile_complete": True})
 
-    # New user: Temporary token
-    temp_token = generate_jwt({
-        "phone": phone,
-        "profile_complete": False
-    }, expires_in_minutes=15)
+        return jsonify({
+            "token": token,
+            "profile_complete": True
+        }), 200
+
+    temp_token = generate_jwt(
+        {
+            "phone": phone,
+            "profile_complete": False
+        },
+        expires_in_minutes=15
+    )
 
     return jsonify({
         "token": temp_token,
         "profile_complete": False
-    })
+    }), 200
 
 @auth.route("/create-profile", methods=["POST"])
 def create_profile():
