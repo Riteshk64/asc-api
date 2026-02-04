@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Firebase Phone Auth Test</title>
+  <meta charset="utf-8" />
+</head>
+<body>
+  <h2>Firebase Phone Auth Test</h2>
+
+  <!-- REQUIRED for Firebase Phone Auth -->
+  <div id="recaptcha-container"></div>
+
+  <input id="phone" placeholder="+919999999999" />
+  <button onclick="sendOTP()">Send OTP</button>
+
+  <br><br>
+
+  <input id="otp" placeholder="OTP" />
+  <button onclick="verifyOTP()">Verify OTP</button>
+
+  <pre id="output"></pre>
+
+  <!-- Firebase SDKs -->
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+
+<script>
+  // Firebase config (yours is already correct)
+  const firebaseConfig = {
+    apiKey: "AIzaSyDPFb4G8DGpA9beDb6fl5qzJf3gRGg8kHs",
+    authDomain: "asc-inventra.firebaseapp.com",
+    projectId: "asc-inventra",
+    appId: "1:119054945037:web:6081fdabf80228ef6abe44"
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+
+  let confirmationResult = null;
+  let recaptchaVerifier = null;
+
+  function resetRecaptcha() {
+    if (recaptchaVerifier) {
+      recaptchaVerifier.clear();
+      recaptchaVerifier = null;
+    }
+
+    document.getElementById("recaptcha-container").innerHTML = "";
+
+    recaptchaVerifier = new firebase.auth.RecaptchaVerifier(
+      "recaptcha-container",
+      {
+        size: "invisible",
+        callback: () => {
+          console.log("reCAPTCHA solved");
+        },
+        "expired-callback": () => {
+          console.log("reCAPTCHA expired");
+        }
+      }
+    );
+  }
+
+  async function sendOTP() {
+    const phone = document.getElementById("phone").value.trim();
+    document.getElementById("output").innerText = "";
+
+    if (!phone.startsWith("+")) {
+      document.getElementById("output").innerText =
+        "Phone number must be in +<countrycode><number> format";
+      return;
+    }
+
+    try {
+      // 🔥 CRITICAL: reset verifier every time
+      resetRecaptcha();
+
+      confirmationResult = await auth.signInWithPhoneNumber(
+        phone,
+        recaptchaVerifier
+      );
+
+      document.getElementById("output").innerText = "OTP sent successfully!";
+    } catch (err) {
+      console.error(err);
+      document.getElementById("output").innerText = err.message;
+    }
+  }
+
+  async function verifyOTP() {
+    const otp = document.getElementById("otp").value.trim();
+
+    if (!confirmationResult) {
+      document.getElementById("output").innerText =
+        "Please request OTP first.";
+      return;
+    }
+
+    try {
+      const result = await confirmationResult.confirm(otp);
+      const idToken = await result.user.getIdToken();
+
+      console.log("🔥 FIREBASE ID TOKEN 🔥");
+      console.log(idToken);
+
+      document.getElementById("output").innerText =
+        "SUCCESS! Check console for Firebase ID Token.";
+    } catch (err) {
+      console.error(err);
+      document.getElementById("output").innerText = err.message;
+    }
+  }
+</script>
+
+</body>
+</html>

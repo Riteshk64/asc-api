@@ -8,7 +8,7 @@ class Product(db.Model):
     product_code = db.Column(db.String(50), unique=True, nullable=False) # SKU
     unit = db.Column(db.String(20), nullable=True)
     category = db.Column(db.String(50), nullable=True)
-    
+    supplier_id = db.Column(db.Integer, db.ForeignKey('suppliers.id'), nullable=True)
     current_stock = db.Column(db.Float, default=0.0)
     
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
@@ -19,6 +19,6 @@ class Product(db.Model):
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "sku": self.product_code,
-            "unit": self.unit, "qty": self.current_stock,
+            "unit": self.unit, "qty": self.current_stock, "supplier_id": self.supplier_id,
             "is_active": self.is_active
         }
