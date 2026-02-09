@@ -5,7 +5,7 @@ from .extensions import db, migrate
 from .config import Config
 
 from .auth.routes import auth
-from .analytics.routes import analytics
+from .analytics.routes import analytics_bp
 from .core.routes import core
 
 from .common.errors import register_error_handlers
@@ -39,7 +39,7 @@ def create_app():
 
     # register blueprints
     app.register_blueprint(auth)
-    app.register_blueprint(analytics)
+    app.register_blueprint(analytics_bp)
     app.register_blueprint(core)
 
     # Logging and error handling

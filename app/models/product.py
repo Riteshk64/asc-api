@@ -16,9 +16,13 @@ class Product(db.Model):
     is_active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    min_stock = db.Column(db.Float, default=10.0)
+    max_stock = db.Column(db.Float, default=100.0)
+
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "sku": self.product_code,
             "unit": self.unit, "qty": self.current_stock, "supplier_id": self.supplier_id,
-            "is_active": self.is_active
+            "is_active": self.is_active, 'min_stock': self.min_stock,  
+            'max_stock': self.max_stock,
         }

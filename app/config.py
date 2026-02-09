@@ -9,3 +9,9 @@ class Config:
         "sqlite:///" + os.path.join(BASE_DIR, "app.db")
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
+    #delete before pushing to production
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,  
+        "pool_recycle": 300,   
+    }

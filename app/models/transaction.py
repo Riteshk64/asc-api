@@ -17,7 +17,7 @@ class Transaction(db.Model):
     
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     
-    # For Recycle Bin
+
     is_active = db.Column(db.Boolean, default=True) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
