@@ -44,7 +44,7 @@ def get_current_user():
     # 2. Logic for Regular Workers
     if user.role != "ADMIN": 
         allowed_menus.append('products')
-        allowed_menus.append('settings')  # ✅ Added Settings here
+        allowed_menus.append('settings') 
 
 
     if user.role == "ADMIN":
@@ -75,12 +75,9 @@ def verify_phone():
         decoded = verify_firebase_token(firebase_token)
         phone = decoded.get("phone_number")
     except Exception as e:
-        
-        print(f"FIREBASE ERROR: {str(e)}") 
-        return jsonify({"success": False, "message": f"Invalid Firebase Token: {str(e)}"}), 401
+        return jsonify({"success": False, "message": "Invalid Firebase Token"}), 401
 
-    
-
+    # Check if user exists
     user = User.query.filter_by(phoneno=phone).first()
 
     if user:
@@ -188,103 +185,6 @@ def create_profile():
 
     return jsonify({"token": token, "role": final_role})
 
-@auth.route("/profile/update", methods=["PUT"])
-@jwt_required
-def update_profile():
-    current_user_id = g.current_user.id
-    current_role = g.role
-
-    
-    
-    data = request.get_json()
-    
-    
-    target_id = data.get("id", current_user_id)
-    
-    
-    if current_role != "ADMIN" and target_id != current_user_id:
-        return jsonify({"message": "Unauthorized"}), 403
-
-    user = User.query.get(target_id)
-    if not user:
-        return jsonify({"message": "User not found"}), 404
-
-    
-    if "first_name" in data: user.first_name = data["first_name"]
-    if "last_name" in data: user.last_name = data["last_name"]
-
-    
-    message = "Profile updated"
-    
-    if "department_id" in data:
-        new_dept = data["department_id"]
-        
-        
-        if user.department_id != new_dept:
-            user.department_id = new_dept
-            
-            
-            if current_role == "ADMIN":
-                user.is_active = True 
-                message = "User department updated by Admin."
-                
-            
-            else:
-                user.is_active = False
-                message = "Department changed. Your account is locked pending Admin approval."
-
-    try:
-        db.session.commit()
-        return jsonify({
-            "message": message, 
-            "is_active": user.is_active
-        }), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"message": "Error updating profile", "error": str(e)}), 500
-    
-
-@auth.route("/admin/pending-users", methods=["GET"])
-@jwt_required
-@admin_only
-def get_locked_users():
-    
-    users = User.query.filter_by(is_active=False).all()
-    
-    results = []
-    for u in users:
-        results.append({
-            "id": u.id,
-            "name": f"{u.first_name} {u.last_name}",
-            "phone": u.phoneno,
-            "department_id": u.department_id, # This is the NEW department they wanted
-            "joined_at": u.created_at
-        })
-    return jsonify(results), 200
-
-
-@auth.route("/admin/approve-user", methods=["POST"])
-@jwt_required
-@admin_only
-def approve_user():
-    
-    data = request.get_json()
-    target_id = data.get("id") # Expecting "id" from frontend
-    
-    if not target_id:
-        return jsonify({"message": "User ID is required"}), 400
-
-    user = User.query.get(target_id)
-    if not user:
-        return jsonify({"message": "User not found"}), 404
-        
-    user.is_active = True
-    db.session.commit()
-    
-    return jsonify({"message": f"User {user.first_name} is now Active."}), 200
-
-
-
-
-    
-    
+@auth.route("/test")
+def test():
+    return jsonify({"message": "Auth route is working!"})
