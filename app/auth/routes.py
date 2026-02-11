@@ -31,28 +31,34 @@ def get_department_name(dept_id, role):
     
     else: 
         return "Unknown"
+    
 
 @auth.route("/my-details", methods=["GET"])
 @jwt_required
 def get_current_user():
-    user = g    
-    department_name = get_department_name(user.department_id, user.role)
+    user = g
 
-    # 1. Base Menus
-    allowed_menus = ['suppliers', 'contractors']
-
-    # 2. Logic for Regular Workers
-    if user.role != "ADMIN": 
-        allowed_menus.append('products')
-        allowed_menus.append('settings') 
-
+    allowed_menus = [] 
 
     if user.role == "ADMIN":
-        allowed_menus.append('admin_panel')
-        allowed_menus.append('transactions')
-        allowed_menus.append('recycle-bin')
- 
-    
+        allowed_menus = [
+            'admin_panel', 'transactions', 'recycle-bin', 
+            'suppliers', 'contractors', 'products', 'settings', 'clients'
+        ]
+        department_name = "Administration"
+
+    else:
+        dept = Department.query.get(user.department_id)
+        
+        if dept and dept.permissions:
+
+            allowed_menus = dept.permissions 
+        else:
+           
+            allowed_menus = ['products', 'settings']
+            
+        department_name = dept.name if dept else "Unknown"
+
     return jsonify({
         "first_name": user.current_user.first_name,
         "last_name": user.current_user.last_name,
@@ -185,6 +191,64 @@ def create_profile():
 
     return jsonify({"token": token, "role": final_role})
 
+
+@auth.route("/profile/update", methods=["PUT"])
+@jwt_required
+def update_profile():
+    user = g.current_user
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    data = request.get_json()
+
+    # 1. Update Basic Info
+    if 'first_name' in data:
+        user.first_name = data['first_name']
+    if 'last_name' in data:
+        user.last_name = data['last_name']
+
+    # 2. Handle Department Change (Only for Non-Admins)
+    # If a regular worker changes their department, we lock the account (is_active=False)
+    # so an Admin must approve the transfer.
+    if user.role != 'ADMIN' and 'department_id' in data:
+        try:
+            new_dept_id = int(data['department_id'])
+            
+            # Only act if the department is ACTUALLY changing
+            if user.department_id != new_dept_id:
+                # Verify the new department exists
+                dept = Department.query.get(new_dept_id)
+                if not dept:
+                    return jsonify({"error": "Invalid Department ID"}), 400
+
+                user.department_id = new_dept_id
+                user.is_active = False  # LOCK ACCOUNT
+                
+                db.session.commit()
+                return jsonify({
+                    "message": "Department changed. Account locked pending approval.",
+                    "is_active": False
+                }), 200
+
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid Department Format"}), 400
+
+    # 3. Save standard changes (if account wasn't locked above)
+    try:
+        db.session.commit()
+        return jsonify({
+            "message": "Profile updated successfully",
+            "is_active": user.is_active,
+            "first_name": user.first_name,
+            "last_name": user.last_name
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 @auth.route("/test")
 def test():
     return jsonify({"message": "Auth route is working!"})
+
+

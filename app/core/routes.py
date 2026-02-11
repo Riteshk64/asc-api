@@ -4,6 +4,7 @@ from app.common.decorators import admin_only
 from app.extensions import db
 from sqlalchemy import func, case, desc
 from datetime import datetime
+from sqlalchemy.orm import joinedload
 
 # Import ALL models
 from app.models.department import Department
@@ -16,15 +17,9 @@ from app.models.activity_log import ActivityLog
 
 core = Blueprint('core', __name__, url_prefix='/core')
 
-# ==========================================
-# HELPER: Context Switcher
-# ==========================================
+
 def get_active_department():
-    """
-    Decides which Department's data to show.
-    - ADMIN: Uses 'X-Department-Id' header (Context Switch).
-    - WORKER: Uses their fixed 'department_id' from token.
-    """
+    
     if g.role == "ADMIN":
         try:
             dept_id = request.headers.get("X-Department-Id")
@@ -32,10 +27,10 @@ def get_active_department():
         except ValueError:
             return None
     return g.department_id
-
+    return g.department_id
 
 # ==========================================
-# 1. STOCK OPERATIONS (In/Out/Quick Adjust)
+# 1. STOCK OPERATIONS (Core Logic)
 # ==========================================
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
@@ -53,6 +48,7 @@ def stock_operation():
     if not sku or not op_type:
         return jsonify({"error": "SKU and operation type are required"}), 400
 
+    # Get Active Department
     active_dept = get_active_department()
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
@@ -60,12 +56,12 @@ def stock_operation():
     # 1. Find product
     product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
 
-    # 2. PRODUCT NOT FOUND LOGIC
+    # 2. Product Not Found Logic
     if not product:
         if op_type != 'in':
             return jsonify({"error": "Product not found"}), 404
 
-        # For Stock IN, we allow creating new products
+        # Allow creating new product on Stock IN
         product_name = data.get('productName')
         if not product_name:
             return jsonify({"error": "Product Name is required for new products"}), 400
@@ -86,15 +82,15 @@ def stock_operation():
     if product.department_id != active_dept:
         return jsonify({"error": "You cannot operate on another department's stock"}), 403
 
+    # Initialize IDs
     supplier_id = None
     contractor_id = None
     default_name = "Manual Adjustment"
 
-    # --- LOGIC: STOCK IN ---
+    # --- LOGIC: STOCK IN (Supply) ---
     if op_type == 'in':
         product.current_stock += qty
 
-        # Use provided name OR default to "Manual Adjustment" for quick buttons
         sup_name = data.get('supplier_name') or default_name
         sup_name = sup_name.strip()
         
@@ -105,14 +101,13 @@ def stock_operation():
             db.session.flush()
         supplier_id = supplier.id
 
-    # --- LOGIC: STOCK OUT ---
+    # --- LOGIC: STOCK OUT (Assign to Contractor) ---
     elif op_type == 'out':
         if product.current_stock < qty:
             return jsonify({"error": f"Insufficient stock. Current: {product.current_stock}"}), 400
 
         product.current_stock -= qty
 
-        # Use provided name OR default to "Manual Adjustment" for quick buttons
         cont_name = data.get('contractor_name') or default_name
         cont_name = cont_name.strip()
         
@@ -123,9 +118,9 @@ def stock_operation():
             db.session.flush()
         contractor_id = contractor.id
 
-    # --- LOGIC: RETURN ---
+    # --- LOGIC: RETURN (Contractor returns to Stock) ---
     elif op_type == 'return':
-        product.current_stock += qty
+        product.current_stock += qty # Add stock back to inventory
         
         cont_name = data.get('contractor_name') or default_name
         cont_name = cont_name.strip()
@@ -136,9 +131,6 @@ def stock_operation():
             db.session.add(contractor)
             db.session.flush()
         contractor_id = contractor.id
-        
-        # Save 'return' as 'in' in DB usually, or keep 'return' if your DB supports it.
-        # Assuming we keep 'return' in DB for clarity, otherwise switch op_type='in' here.
 
     # Create Transaction
     txn = Transaction(
@@ -147,6 +139,7 @@ def stock_operation():
         quantity=qty,
         supplier_id=supplier_id,
         contractor_id=contractor_id,
+        department_id=active_dept,
         created_by=g.current_user.id,
         is_active=True 
     )
@@ -154,7 +147,6 @@ def stock_operation():
     try:
         db.session.add(txn)
         
-        # Activity Log
         log = ActivityLog(
             user_id=g.current_user.id,
             action=f"Stock {op_type.upper()}: {qty} {product.unit} - {product.name}",
@@ -162,7 +154,6 @@ def stock_operation():
         )
         db.session.add(log)
         
-        # Explicitly update product to ensure stock change saves
         db.session.add(product) 
         db.session.commit()
 
@@ -174,6 +165,7 @@ def stock_operation():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
 
 
 # ==========================================
@@ -225,7 +217,6 @@ def update_product(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 def get_transactions():
@@ -236,7 +227,9 @@ def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
 
+    # Join with Product table
     query = Transaction.query.join(Product).filter(
+        Product.department_id == active_dept,
         Transaction.is_active == True,
     )
 
@@ -250,9 +243,33 @@ def get_transactions():
             pass
 
     txns = query.order_by(desc(Transaction.created_at)).all()
-    return jsonify([t.to_dict() for t in txns]), 200
+    
+    results = []
+    for t in txns:
+        # Entity Name Logic
+        entity_name = "Manual Adjustment"
+        if t.type == 'in' and t.supplier:
+            entity_name = f"Supplier: {t.supplier.name}"
+        elif t.type == 'out' and t.contractor:
+            entity_name = f"Contractor: {t.contractor.name}"
+        elif t.type == 'return' and t.contractor:
+            entity_name = f"Returned by: {t.contractor.name}"
 
-# app/core/routes.py
+        results.append({
+            "id": t.id,
+            "date": t.created_at.strftime('%Y-%m-%d'),
+            "type": t.type,
+            "product_id": t.product_id,  # 👈 THIS IS THE MISSING KEY!
+            "product": t.product.name if t.product else "Unknown",
+            "sku": t.product.product_code if t.product else "",
+            "qty": t.quantity,
+            "entity": entity_name,
+            "is_active": t.is_active,
+            "supplier_id": t.supplier_id,
+            "contractor_id": t.contractor_id
+        })
+
+    return jsonify(results), 200
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
@@ -376,6 +393,55 @@ def restore_transaction(id):
 
     db.session.commit()
     return jsonify({"message": "Transaction restored and stock updated"}), 200
+
+@core.route('/transactions/<int:id>', methods=['DELETE'])
+@jwt_required
+def delete_transaction(id):
+    """
+    Soft Delete: Moves transaction to Recycle Bin.
+    CRITICAL: It immediately REVERSES the stock impact to keep inventory accurate.
+    """
+    txn = Transaction.query.get(id)
+    if not txn: return jsonify({"error": "Transaction not found"}), 404
+
+    # Permission Check: Only Admin or the Department that owns the product
+    if g.role != 'ADMIN' and txn.product.department_id != g.department_id:
+         return jsonify({"error": "Unauthorized"}), 403
+
+    product = txn.product
+
+    # === REVERSE STOCK IMPACT ===
+    
+    if txn.type == 'in' or txn.type == 'return':
+        # Originally added stock -> Now we must REMOVE it.
+        if product.current_stock < txn.quantity:
+             return jsonify({"error": "Cannot delete: Resulting stock would be negative"}), 400
+        product.current_stock -= txn.quantity
+
+    elif txn.type == 'out':
+        # Originally removed stock -> Now we must ADD it back.
+        product.current_stock += txn.quantity
+
+    # Soft Delete Flag
+    txn.is_active = False
+    
+    log = ActivityLog(
+        user_id=g.current_user.id,
+        action=f"Moved Txn #{txn.id} to Recycle Bin",
+        transaction_id=txn.id
+    )
+    db.session.add(log)
+    db.session.add(product)
+
+    try:
+        db.session.commit()
+        return jsonify({
+            "message": "Transaction moved to Recycle Bin", 
+            "new_stock": product.current_stock
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500   
 
 
 @core.route('/recycle-bin/<int:id>/permanent', methods=['DELETE'])
@@ -534,16 +600,45 @@ def get_departments_by_id(id):
 @admin_only
 def add_department():
     data = request.get_json()
-    if not data or 'name' not in data:
+
+    if not data or 'name' not in data or 'permissions' not in data:
         return jsonify({"error": "Name is required"}), 400
     
     if Department.query.filter_by(name=data['name']).first():
         return jsonify({"error": "Department already exists"}), 400
+    
 
-    new_dept = Department(name=data['name'], is_active=True)
+    new_dept = Department(name=data['name'],permissions=data['permissions'], is_active=True)
     db.session.add(new_dept)
     db.session.commit()
     return jsonify({"message": "Department added", "department": new_dept.to_dict()}), 201
+
+@core.route('/departments/<int:id>', methods=['PUT'])
+@jwt_required
+@admin_only
+def update_department(dept_id): 
+    dept = Department.query.get(dept_id)
+
+    if not dept: 
+        return jsonify({"error": "Department does not exist"}, 400)
+    
+    data = request.get_json()
+
+    if 'name' in data and data['name'] != dept.name: 
+        existing = Department.query.filter_by(name =data['name']).first
+        if existing: 
+            return jsonify({"error":"Department name already exists"}, 400)
+        dept.name = data['name']
+
+    if 'permissions' in data:
+        dept.permissions = data['permissions']
+
+    if 'is_active' in data: 
+        dept.is_active = data['is_active']
+
+    return jsonify({"message": "Department updated", "department": dept.to_dict()}, 200)     
+
+
 
 @core.route('/suppliers', methods=['GET'])
 @jwt_required
@@ -685,68 +780,96 @@ def get_contractor_stock(id):
             "qty": r.net_qty
         })
     return jsonify(stock_list), 200
-# app/core/routes.py
 
-@core.route('/analytics', methods=['GET'])
+@core.route("/suppliers/<int:id>/products", methods=["GET"])
 @jwt_required
-@admin_only
-def get_analytics():
+def get_supplier_products(id): 
+    try:
+        # Check if we need drill-down data
+        product_id = request.args.get('product_id')
+
+        # --- MODE 1: Drill Down (Transaction History) ---
+        if product_id:
+            transactions = Transaction.query.filter(
+                Transaction.supplier_id == id,
+                Transaction.product_id == product_id,
+                # Using lower() ensures case-insensitivity ('IN', 'in')
+                func.lower(Transaction.type) == 'in'
+            ).order_by(Transaction.created_at.desc()).all()
+
+            return jsonify([t.to_dict() for t in transactions]), 200
+
+        # --- MODE 2: Consolidated View (Main Table) ---
+        results = db.session.query(
+            Product.id,  # Need ID for the drill-down link
+            Product.name,
+            Product.product_code,
+            func.sum(Transaction.quantity).label('total_supplied'),
+            func.max(Transaction.created_at).label('last_supplied')
+        ).join(Transaction, Transaction.product_id == Product.id)\
+         .filter(
+             Transaction.supplier_id == id,
+             func.lower(Transaction.type) == 'in'
+         )\
+         .group_by(Product.id)\
+         .all()
+
+        data = []
+        for r in results:
+            data.append({
+                "id": r.id,
+                "name": r.name,
+                "sku": r.product_code,
+                "total_supplied": r.total_supplied,
+                "last_supplied": r.last_supplied.strftime('%Y-%m-%d') if r.last_supplied else "N/A"
+            })
+
+        return jsonify(data), 200
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return jsonify({"error": "Failed to fetch supplier data"}), 500
+
+
+@core.route('/products/<int:id>/transactions', methods=['GET'])
+@jwt_required
+def get_product_transactions(id):
     active_dept = get_active_department()
-    start_str = request.args.get('start_date')
-    end_str = request.args.get('end_date')
-    
-    # ✅ NEW: Check which specific chart data is requested
-    # If None, return ALL (for backward compatibility or initial load)
-    data_type = request.args.get('type') 
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
 
-    # Base Filters
-    filters = [Transaction.is_active == True]
-    if active_dept: filters.append(Product.department_id == active_dept)
-    
-    # Date Filter
-    if start_str and end_str:
-        try:
-            s = datetime.strptime(start_str, '%Y-%m-%d')
-            e = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23,minute=59,second=59)
-            filters.append(Transaction.created_at.between(s, e))
-        except: pass
+    # Fetch product to ensure it exists and belongs to dept
+    product = Product.query.filter_by(id=id, department_id=active_dept).first()
+    if not product:
+        return jsonify({"error": "Product not found"}), 404
 
-    response = {}
+    # Fetch transactions for this product
+    txns = Transaction.query\
+        .options(
+            joinedload(Transaction.supplier),
+            joinedload(Transaction.contractor)
+        )\
+        .filter(Transaction.product_id == id, Transaction.is_active == True)\
+        .order_by(desc(Transaction.created_at))\
+        .all()
 
-    # --- 1. FREQUENCY & HIGH PRESSURE ---
-    if not data_type or data_type == 'frequency':
-        freq_data = db.session.query(Product.name, func.count(Transaction.id).label('c'))\
-            .join(Product).filter(*filters).group_by(Product.name).order_by(desc('c')).limit(10).all()
-        
-        # We calculate consistent pressure here too as it's related
-        out_pressure_filters = filters + [Transaction.type == 'out']
-        pressure_data = db.session.query(Product.name, func.count(Transaction.id).label('hits'))\
-            .join(Product).filter(*out_pressure_filters).group_by(Product.name).order_by(desc('hits')).limit(5).all()
+    results = []
+    for t in txns:
+        entity_name = "Manual Adjustment"
+        if t.type == 'in' and t.supplier:
+            entity_name = f"Supplier: {t.supplier.name}"
+        elif t.type == 'out' and t.contractor:
+            entity_name = f"Contractor: {t.contractor.name}"
+        elif t.type == 'return' and t.contractor:
+            entity_name = f"Returned by: {t.contractor.name}"
 
-        response['frequency'] = [{"name": r[0], "count": r[1]} for r in freq_data]
-        response['consistent_pressure'] = [{"name": r[0], "hits": r[1]} for r in pressure_data]
+        results.append({
+            "id": t.id,
+            "date": t.created_at.strftime('%Y-%m-%d'),
+            "type": t.type,
+            "qty": t.quantity,
+            "entity": entity_name,
+            "is_active": t.is_active
+        })
 
-    # --- 2. TOP SOLD (STOCK OUTS) ---
-    if not data_type or data_type == 'top_sold':
-        out_filters = filters + [Transaction.type == 'out']
-        sold_data = db.session.query(Product.name, func.sum(Transaction.quantity).label('q'))\
-            .join(Product).filter(*out_filters).group_by(Product.name).order_by(desc('q')).limit(5).all()
-        
-        response['top_sold'] = [{"name": r[0], "qty": r[1]} for r in sold_data]
-
-    # --- 3. TOP SUPPLIERS ---
-    if not data_type or data_type == 'top_suppliers':
-        in_filters = filters + [Transaction.type == 'in', Transaction.supplier_id != None]
-        sup_data = db.session.query(Supplier.name, func.sum(Transaction.quantity).label('q'))\
-            .join(Transaction).filter(*in_filters).group_by(Supplier.name).order_by(desc('q')).limit(5).all()
-        
-        response['top_suppliers'] = [{"name": r[0], "qty": r[1]} for r in sup_data]
-
-    # --- 4. LOW STOCK (Always Return or separate? Let's keep it separate/global) ---
-    if not data_type or data_type == 'low_stock':
-        low_stock_query = Product.query.filter(Product.is_active == True, Product.current_stock <= Product.min_stock)
-        if active_dept: low_stock_query = low_stock_query.filter(Product.department_id == active_dept)
-        low_stock_items = low_stock_query.order_by(Product.current_stock.asc()).all()
-        response['low_stock'] = [p.to_dict() for p in low_stock_items]
-
-    return jsonify(response), 200
+    return jsonify(results), 200        

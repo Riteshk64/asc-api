@@ -4,7 +4,9 @@ class Department(db.Model):
     __tablename__ = 'departments'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    is_active = db.Column(db.Boolean, default=True) 
+    is_active = db.Column(db.Boolean, default=True)
+
+    permissions = db.Column(db.JSON, default=list()) 
 
     def to_dict(self):
-        return {"id": self.id, "name": self.name, "is_active": self.is_active}
+        return {"id": self.id, "name": self.name, "is_active": self.is_active, "permissions": self.permissions}
