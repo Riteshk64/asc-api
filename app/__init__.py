@@ -7,6 +7,7 @@ from .config import Config
 from .auth.routes import auth
 from .analytics.routes import analytics_bp
 from .core.routes import core
+from .attendance.routes import attendance
 
 from .common.errors import register_error_handlers
 from .common.logging import setup_logging
@@ -31,6 +32,7 @@ def create_app():
     from app.models.activity_log import ActivityLog
     from app.models.transaction import Transaction
     from app.models.supplier import Supplier
+    from app.models.attendance import Attendance
 
 
 
@@ -41,6 +43,7 @@ def create_app():
     app.register_blueprint(auth)
     app.register_blueprint(analytics_bp)
     app.register_blueprint(core)
+    app.register_blueprint(attendance)
 
     # Logging and error handling
     setup_logging(app)

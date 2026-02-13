@@ -5,6 +5,7 @@ from app.extensions import db
 from sqlalchemy import func, case, desc
 from datetime import datetime
 from sqlalchemy.orm import joinedload
+from sqlalchemy import or_
 
 # Import ALL models
 from app.models.department import Department
@@ -26,7 +27,6 @@ def get_active_department():
             return int(dept_id) if dept_id else None
         except ValueError:
             return None
-    return g.department_id
     return g.department_id
 
 # ==========================================
@@ -184,6 +184,8 @@ def get_products():
     ).all()
 
     return jsonify([p.to_dict() for p in products]), 200
+
+
 @core.route('/products/<int:id>', methods=['PUT'])
 @jwt_required
 def update_product(id):
@@ -198,11 +200,11 @@ def update_product(id):
 
     data = request.get_json()
     
-    # Existing fields
+
     if 'name' in data: product.name = data['name']
     if 'sku' in data: product.product_code = data['sku']
     
-    # ✅ NEW FIELDS
+
     if 'min_stock' in data: 
         try: product.min_stock = float(data['min_stock'])
         except: pass
@@ -217,22 +219,34 @@ def update_product(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
 @core.route('/transactions', methods=['GET'])
 @jwt_required
+@admin_only
 def get_transactions():
-    active_dept = get_active_department()
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
-
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    
+    # ✅ USE THE HELPER (Reads X-Department-Id header automatically)
+    active_dept = get_active_department()
 
-    # Join with Product table
-    query = Transaction.query.join(Product).filter(
-        Product.department_id == active_dept,
-        Transaction.is_active == True,
-    )
+    # Base Query
+    query = Transaction.query\
+        .join(Product)\
+        .outerjoin(Supplier)\
+        .outerjoin(Contractor)\
+        .filter(
+            Transaction.is_active == True,
+            Product.is_active == True,
+            or_(Supplier.id == None, Supplier.is_active == True),
+            or_(Contractor.id == None, Contractor.is_active == True)
+        )
 
+    # ✅ FILTER BY DEPT (If header was present, this filters. If None, shows all)
+    if active_dept:
+        query = query.filter(Product.department_id == active_dept)
+
+    # Date Filters
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
@@ -347,36 +361,45 @@ def update_transaction(id):
 @jwt_required
 @admin_only
 def get_recycle_bin():
-    active_dept = get_active_department()
     
-    query = Transaction.query.filter_by(is_active=False)
-    if active_dept:
-        query = query.join(Product).filter(Product.department_id == active_dept)
+    txns = Transaction.query\
+        .join(Product)\
+        .filter(Transaction.is_active == False, Product.is_active == True)\
+        .order_by(desc(Transaction.created_at)).all()
     
-    transactions = query.order_by(desc(Transaction.created_at)).all()
-    return jsonify([t.to_dict() for t in transactions]), 200
+    products = Product.query.filter_by(is_active = False).all()
 
+    suppliers = Supplier.query.filter_by(is_active=False).all()
+
+    contractors = Contractor.query.filter_by(is_active=False).all()
+    
+    
+    return jsonify({
+        "transactions": [t.to_dict() for t in txns],
+        "products": [p.to_dict() for p in products],
+        "suppliers": [s.to_dict() for s in suppliers],
+        "contractors": [c.to_dict() for c in contractors]
+    }), 200
 
 @core.route('/recycle-bin/<int:id>/restore', methods=['PUT'])
 @jwt_required
 @admin_only
 def restore_transaction(id):
-    """
-    Restore: Re-applies the stock change and sets is_active=True.
-    """
     txn = Transaction.query.get(id)
     if not txn:
         return jsonify({"error": "Transaction not found"}), 404
 
     product = txn.product
 
+    # ✅ SAFETY CHECK: Prevent restoring txn if Product is deleted
+    if not product or not product.is_active:
+        return jsonify({"error": "Cannot restore transaction: Parent Product is deleted"}), 400
+
     # === LOGIC: RE-APPLY STOCK CHANGE ===
     if txn.type == 'in' or txn.type == 'return':
-        # Add it back
         product.current_stock += txn.quantity
 
     elif txn.type == 'out':
-        # Remove it again
         if product.current_stock < txn.quantity:
              return jsonify({"error": "Cannot restore: Not enough stock available"}), 400
         product.current_stock -= txn.quantity
@@ -389,7 +412,7 @@ def restore_transaction(id):
         transaction_id=txn.id
     )
     db.session.add(log)
-    db.session.add(product) # Force Product Update
+    db.session.add(product)
 
     db.session.commit()
     return jsonify({"message": "Transaction restored and stock updated"}), 200
@@ -397,10 +420,7 @@ def restore_transaction(id):
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
 def delete_transaction(id):
-    """
-    Soft Delete: Moves transaction to Recycle Bin.
-    CRITICAL: It immediately REVERSES the stock impact to keep inventory accurate.
-    """
+
     txn = Transaction.query.get(id)
     if not txn: return jsonify({"error": "Transaction not found"}), 404
 
@@ -443,22 +463,115 @@ def delete_transaction(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500   
 
-
-@core.route('/recycle-bin/<int:id>/permanent', methods=['DELETE'])
+@core.route('/recycle-bin/<string:type>/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
-def permanent_delete_transaction(id):
-    txn = Transaction.query.get(id)
-    if not txn: return jsonify({"error": "Transaction not found"}), 404
+def delete_permanently(type, id):
+    try:
+        # ====================================================
+        # 1. PERMANENT DELETE CONTRACTOR
+        # ====================================================
+        if type == 'contractor':
+            contractor = Contractor.query.get(id)
+            if not contractor: 
+                return jsonify({"error": "Contractor not found"}), 404
 
-    db.session.delete(txn)
-    db.session.commit()
-    return jsonify({"message": "Permanently deleted"}), 200
+            # Get all transactions linked to this contractor
+            txns = Transaction.query.filter_by(contractor_id=id).all()
+
+            for txn in txns:
+                # REVERSE THE TRANSACTION IMPACT
+                if txn.product:
+                    if txn.type == 'out':
+                        # They took stock -> We put it back
+                        txn.product.current_stock += txn.quantity
+                        
+                    elif txn.type == 'return':
+                        # They returned stock -> We remove it (undo the return)
+                        # Safety check: ensure we don't go negative
+                        if txn.product.current_stock >= txn.quantity:
+                            txn.product.current_stock -= txn.quantity
+                        else:
+                            # If we can't undo the return without going negative, 
+                            # it implies the returned stock was used elsewhere.
+                            # We force stock to 0 or leave it (business decision).
+                            txn.product.current_stock = 0
+
+                # Delete the transaction record
+                db.session.delete(txn)
+
+            # Finally, delete the contractor
+            db.session.delete(contractor)
 
 
-# ==========================================
-# 4. AUXILIARY ROUTES (Employees, Depts, etc.)
-# ==========================================
+        # ====================================================
+        # 2. PERMANENT DELETE SUPPLIER
+        # ====================================================
+        elif type == 'supplier':
+            supplier = Supplier.query.get(id)
+            if not supplier: 
+                return jsonify({"error": "Supplier not found"}), 404
+
+            # Get all 'Stock In' transactions from this supplier
+            txns = Transaction.query.filter_by(supplier_id=id).all()
+
+            products_to_delete = set()
+
+            for txn in txns:
+                if txn.product_id in products_to_delete:
+                    continue # Skip if we already decided to delete this product
+
+                if txn.product:
+                    if txn.type == 'in':
+                        # Logic: We are removing the record of stock arrival.
+                        # So we must DEDUCT that stock from current inventory.
+                        
+                        if txn.product.current_stock >= txn.quantity:
+                            # Scenario A: We have enough stock to just remove it.
+                            txn.product.current_stock -= txn.quantity
+                            db.session.delete(txn)
+                        else:
+                            # Scenario B: The stock provided by this supplier is already gone (sold/used).
+                            # We cannot have negative stock. 
+                            # Per your instruction: DELETE THE PRODUCT ITSELF.
+                            products_to_delete.add(txn.product_id)
+
+            # Process the "Corrupted" Products (where stock would have gone negative)
+            for prod_id in products_to_delete:
+                product = Product.query.get(prod_id)
+                if product:
+                    # Delete ALL transactions for this product (clean wipe)
+                    Transaction.query.filter_by(product_id=prod_id).delete()
+                    # Delete the product
+                    db.session.delete(product)
+
+            # Finally, delete the supplier
+            db.session.delete(supplier)
+
+
+        # ====================================================
+        # 3. OTHER TYPES (Standard Logic)
+        # ====================================================
+        elif type == 'product':
+            product = Product.query.get(id)
+            if not product: return jsonify({"error": "Product not found"}), 404
+            
+            Transaction.query.filter_by(product_id=id).delete()
+            db.session.delete(product)
+
+        elif type == 'transaction':
+            txn = Transaction.query.get(id)
+            if not txn: return jsonify({"error": "Transaction not found"}), 404
+            db.session.delete(txn)
+
+        db.session.commit()
+        return jsonify({"message": f"{type.capitalize()} permanently deleted"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
 @core.route('/employees', methods=['GET'])
 @jwt_required
 @admin_only
@@ -616,8 +729,8 @@ def add_department():
 @core.route('/departments/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
-def update_department(dept_id): 
-    dept = Department.query.get(dept_id)
+def update_department(id): 
+    dept = Department.query.get(id)
 
     if not dept: 
         return jsonify({"error": "Department does not exist"}, 400)
@@ -625,7 +738,7 @@ def update_department(dept_id):
     data = request.get_json()
 
     if 'name' in data and data['name'] != dept.name: 
-        existing = Department.query.filter_by(name =data['name']).first
+        existing = Department.query.filter_by(name =data['name']).first()
         if existing: 
             return jsonify({"error":"Department name already exists"}, 400)
         dept.name = data['name']
@@ -636,7 +749,12 @@ def update_department(dept_id):
     if 'is_active' in data: 
         dept.is_active = data['is_active']
 
-    return jsonify({"message": "Department updated", "department": dept.to_dict()}, 200)     
+    try:
+        db.session.commit()
+        return jsonify({"message": "Department updated", "department": dept.to_dict()}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500   
 
 
 
@@ -704,11 +822,7 @@ def get_contractors():
 def add_product():
     data = request.get_json()
     sku = data.get('sku')
-    sup_name = data.get('supplier_name')
-    sup_contact = data.get('supplier_contact')
-
-    if not sup_contact: 
-        return jsonify({"error": "Number needs to be provided"}), 400
+    unit = data.get('unit')
     
     active_dept = get_active_department()
     if not active_dept:
@@ -716,36 +830,105 @@ def add_product():
 
     if Product.query.filter_by(product_code=sku).first():
         return jsonify({"error": "SKU exists"}), 400
-        
-    if sup_name:
-        sup_name = sup_name.strip()
-        supplier = Supplier.query.filter(
-            Supplier.name.ilike(sup_name), 
-            Supplier.department_id == active_dept
-        ).first()
-
-        if not supplier:
-            supplier = Supplier(
-                name=sup_name, 
-                phone_number=sup_contact,
-                department_id=active_dept, 
-                is_active=True
-            )
-            db.session.add(supplier)
-            db.session.flush()
 
     new_p = Product(
         name=data['name'],
         product_code=sku,
-        unit=data.get('unit'),
+        unit=unit,
         category=data.get('category'),
-        current_stock=float(data.get('qty', 0)),
+        current_stock=0,
         department_id=active_dept,
         is_active=True
     )
     db.session.add(new_p)
     db.session.commit()
     return jsonify({"message": "Product created"}), 201
+
+
+@core.route('/products/<int:id>', methods=['DELETE'])
+@jwt_required
+@admin_only
+def delete_product(id):
+
+    active_department = get_active_department()
+    product = Product.query.get(id)
+    if not product: 
+        return jsonify({"error": "Product does not exist"}, 404)
+    
+    if active_department and product.department_id != active_department: 
+        return jsonify({"error": "Department Id does not match with product department id"}, 403)
+    
+    
+    if product.is_active is False: 
+        return jsonify({"error":"Product has already been deleted from frontend"}, 400)
+    
+    product.is_active = False
+
+    try:
+        db.session.commit()
+        return jsonify({"message": "Product was successfully deleted from frontend"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
+
+@core.route('/suppliers/<int:id>', methods=['DELETE'])
+@jwt_required
+@admin_only
+def delete_suppliers(id): 
+    supplier = Supplier.query.get(id)
+    active_dept = get_active_department()
+
+    if not supplier: 
+        return jsonify({"error": "Supplier does not exist"}, 404)
+    
+    if active_dept and supplier.department_id != active_dept: 
+        return jsonify({"error": "User is not Authorized to make this action"}, 401)
+    
+
+    if supplier.is_active == False: 
+        return jsonify({"error": "Supplier is already inactive"}, 400)
+    
+    
+    
+    supplier.is_active = False
+
+    try: 
+        db.session.commit()
+        return jsonify({"message": "Supplier successfully removed"}, 200)
+    
+    except Exception as e: 
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    
+@core.route('/contractors/<int:id>', methods=['DELETE'])
+@jwt_required
+@admin_only
+def delete_contractor(id): 
+    contractor = Contractor.query.get(id)
+
+    if not contractor: 
+        return jsonify({"error": "Contractor does not exist"}), 404
+    
+    # --- Department Check (Optional) ---
+    # Only enable this if your Contractor model has a 'department_id' column
+    # if active_dept and contractor.department_id != active_dept: 
+    #     return jsonify({"error": "User is not Authorized to make this action"}, 401)
+    
+    if contractor.is_active == False: 
+        return jsonify({"error": "Contractor is already inactive"}), 400
+    
+    contractor.is_active = False
+
+    try: 
+        db.session.commit()
+        return jsonify({"message": "Contractor successfully removed"}), 200
+    
+    except Exception as e: 
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
 
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
@@ -757,15 +940,18 @@ def get_contractor_stock(id):
         Product.unit,
         func.sum(case(
             (Transaction.type == 'out', Transaction.quantity), 
-            (Transaction.type == 'in', -Transaction.quantity), 
+            (Transaction.type == 'return', -Transaction.quantity), # Subtract returns
             else_=0
         )).label('net_qty')
     ).join(Transaction)\
-     .filter(Transaction.contractor_id == id, Transaction.is_active == True)\
+     .filter(
+         Transaction.contractor_id == id, 
+         Transaction.is_active == True  # ✅ CRITICAL FIX: Ignore deleted transactions
+     )\
      .group_by(Product.id, Product.name, Product.product_code, Product.unit)\
      .having(func.sum(case(
             (Transaction.type == 'out', Transaction.quantity),
-            (Transaction.type == 'in', -Transaction.quantity),
+            (Transaction.type == 'return', -Transaction.quantity),
             else_=0
         )) > 0)\
      .all()
@@ -834,12 +1020,9 @@ def get_supplier_products(id):
 @core.route('/products/<int:id>/transactions', methods=['GET'])
 @jwt_required
 def get_product_transactions(id):
-    active_dept = get_active_department()
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
 
-    # Fetch product to ensure it exists and belongs to dept
-    product = Product.query.filter_by(id=id, department_id=active_dept).first()
+
+    product = Product.query.get(id)
     if not product:
         return jsonify({"error": "Product not found"}), 404
 
@@ -849,7 +1032,11 @@ def get_product_transactions(id):
             joinedload(Transaction.supplier),
             joinedload(Transaction.contractor)
         )\
-        .filter(Transaction.product_id == id, Transaction.is_active == True)\
+        .filter(
+            Transaction.product_id == id, 
+            Transaction.is_active == True,
+            or_(Supplier.id == None, Supplier.is_active == True)
+        )\
         .order_by(desc(Transaction.created_at))\
         .all()
 
@@ -872,4 +1059,13 @@ def get_product_transactions(id):
             "is_active": t.is_active
         })
 
-    return jsonify(results), 200        
+    return jsonify(results), 200     
+
+
+
+    
+
+
+
+
+
