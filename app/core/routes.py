@@ -226,8 +226,7 @@ def update_product(id):
 def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
-    
-    # ✅ USE THE HELPER (Reads X-Department-Id header automatically)
+
     active_dept = get_active_department()
 
     # Base Query
@@ -241,8 +240,6 @@ def get_transactions():
             or_(Supplier.id == None, Supplier.is_active == True),
             or_(Contractor.id == None, Contractor.is_active == True)
         )
-
-    # ✅ FILTER BY DEPT (If header was present, this filters. If None, shows all)
     if active_dept:
         query = query.filter(Product.department_id == active_dept)
 
@@ -356,23 +353,36 @@ def update_transaction(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-
 @core.route('/recycle-bin', methods=['GET'])
 @jwt_required
 @admin_only
 def get_recycle_bin():
-    
-    txns = Transaction.query\
+    active_dept = get_active_department() # <--- 1. Get the Context
+
+    # --- Transactions ---
+    txn_query = Transaction.query\
         .join(Product)\
-        .filter(Transaction.is_active == False, Product.is_active == True)\
-        .order_by(desc(Transaction.created_at)).all()
+        .filter(Transaction.is_active == False, Product.is_active == True)
     
-    products = Product.query.filter_by(is_active = False).all()
+    if active_dept:
+        txn_query = txn_query.filter(Product.department_id == active_dept) # <--- Filter
+    
+    txns = txn_query.order_by(desc(Transaction.created_at)).all()
+    
+    # --- Products ---
+    prod_query = Product.query.filter_by(is_active=False)
+    if active_dept:
+        prod_query = prod_query.filter_by(department_id=active_dept) # <--- Filter
+    products = prod_query.all()
 
-    suppliers = Supplier.query.filter_by(is_active=False).all()
+    # --- Suppliers ---
+    sup_query = Supplier.query.filter_by(is_active=False)
+    if active_dept:
+        sup_query = sup_query.filter_by(department_id=active_dept) # <--- Filter
+    suppliers = sup_query.all()
 
+    # --- Contractors (Usually Global, but can be filtered if needed) ---
     contractors = Contractor.query.filter_by(is_active=False).all()
-    
     
     return jsonify({
         "transactions": [t.to_dict() for t in txns],
@@ -381,41 +391,98 @@ def get_recycle_bin():
         "contractors": [c.to_dict() for c in contractors]
     }), 200
 
-@core.route('/recycle-bin/<int:id>/restore', methods=['PUT'])
+@core.route('/recycle-bin/<string:type>/<int:id>/restore', methods=['PUT'])
 @jwt_required
 @admin_only
-def restore_transaction(id):
-    txn = Transaction.query.get(id)
-    if not txn:
-        return jsonify({"error": "Transaction not found"}), 404
-
-    product = txn.product
-
-    # ✅ SAFETY CHECK: Prevent restoring txn if Product is deleted
-    if not product or not product.is_active:
-        return jsonify({"error": "Cannot restore transaction: Parent Product is deleted"}), 400
-
-    # === LOGIC: RE-APPLY STOCK CHANGE ===
-    if txn.type == 'in' or txn.type == 'return':
-        product.current_stock += txn.quantity
-
-    elif txn.type == 'out':
-        if product.current_stock < txn.quantity:
-             return jsonify({"error": "Cannot restore: Not enough stock available"}), 400
-        product.current_stock -= txn.quantity
-
-    txn.is_active = True
+def restore_any_entity(type, id):
     
-    log = ActivityLog(
-        user_id=g.current_user.id, 
-        action=f"Restored Transaction #{txn.id}", 
-        transaction_id=txn.id
-    )
-    db.session.add(log)
-    db.session.add(product)
+    try:
+        # ====================================================
+        # 1. RESTORE SUPPLIER
+        # ====================================================
+        if type == 'supplier':
+            supplier = Supplier.query.get(id)
+            if not supplier: return jsonify({"error": "Supplier not found"}), 404
+            
+            supplier.is_active = True
+            db.session.add(supplier)
+            
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Supplier: {supplier.name}")
+            db.session.add(log)
 
-    db.session.commit()
-    return jsonify({"message": "Transaction restored and stock updated"}), 200
+
+        # ====================================================
+        # 2. RESTORE CONTRACTOR
+        # ====================================================
+        elif type == 'contractor':
+            contractor = Contractor.query.get(id)
+            if not contractor: return jsonify({"error": "Contractor not found"}), 404
+            
+            contractor.is_active = True
+            db.session.add(contractor)
+            
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Contractor: {contractor.name}")
+            db.session.add(log)
+
+
+        # ====================================================
+        # 3. RESTORE PRODUCT
+        # ====================================================
+        elif type == 'product':
+            product = Product.query.get(id)
+            if not product: return jsonify({"error": "Product not found"}), 404
+            
+            # Check if Department is active? (Optional)
+            
+            product.is_active = True
+            db.session.add(product)
+            
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Product: {product.name}")
+            db.session.add(log)
+
+
+        # ====================================================
+        # 4. RESTORE TRANSACTION (Complex Logic)
+        # ====================================================
+        elif type == 'transaction':
+            txn = Transaction.query.get(id)
+            if not txn: return jsonify({"error": "Transaction not found"}), 404
+
+            product = txn.product
+
+            # Safety: Can't restore txn if Product is gone
+            if not product or not product.is_active:
+                return jsonify({"error": "Cannot restore transaction: Parent Product is deleted"}), 400
+
+            # Re-Apply Stock Logic
+            if txn.type == 'in' or txn.type == 'return':
+                product.current_stock += txn.quantity
+            elif txn.type == 'out':
+                if product.current_stock < txn.quantity:
+                    return jsonify({"error": "Cannot restore: Not enough stock available"}), 400
+                product.current_stock -= txn.quantity
+
+            txn.is_active = True
+            db.session.add(txn)
+            db.session.add(product)
+            
+            log = ActivityLog(
+                user_id=g.current_user.id, 
+                action=f"Restored Transaction #{txn.id}", 
+                transaction_id=txn.id
+            )
+            db.session.add(log)
+
+        else:
+            return jsonify({"error": "Invalid entity type"}), 400
+
+        # Commit whatever happened above
+        db.session.commit()
+        return jsonify({"message": f"{type.capitalize()} restored successfully"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -757,15 +824,18 @@ def update_department(id):
         return jsonify({"error": str(e)}), 500   
 
 
-
 @core.route('/suppliers', methods=['GET'])
 @jwt_required
 def get_suppliers():
-    active_dept = get_active_department()
+    # Ensure this function reads the 'X-Department-Id' header from the request
+    active_dept = get_active_department() 
+    
     if g.role == "ADMIN" and not active_dept:
          suppliers = Supplier.query.filter_by(is_active=True).all()
     else:
+         # This forces the filter to the selected department
          suppliers = Supplier.query.filter_by(is_active=True, department_id=active_dept).all()
+    
     return jsonify([s.to_dict() for s in suppliers]), 200
 
 @core.route('/suppliers/<int:id>', methods=['PUT'])
@@ -1016,30 +1086,46 @@ def get_supplier_products(id):
         print(f"Error: {e}")
         return jsonify({"error": "Failed to fetch supplier data"}), 500
 
-
 @core.route('/products/<int:id>/transactions', methods=['GET'])
 @jwt_required
 def get_product_transactions(id):
-
-
+    # 1. Product Existence Check
     product = Product.query.get(id)
     if not product:
         return jsonify({"error": "Product not found"}), 404
 
-    # Fetch transactions for this product
-    txns = Transaction.query\
-        .options(
-            joinedload(Transaction.supplier),
-            joinedload(Transaction.contractor)
-        )\
-        .filter(
-            Transaction.product_id == id, 
-            Transaction.is_active == True,
-            or_(Supplier.id == None, Supplier.is_active == True)
-        )\
-        .order_by(desc(Transaction.created_at))\
-        .all()
+    # 2. Get Date Filters from Query Params
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
 
+    # 3. Build Base Query (Identical to get_transactions, but filtered by ID)
+    query = Transaction.query\
+        .join(Product)\
+        .outerjoin(Supplier)\
+        .outerjoin(Contractor)\
+        .filter(
+            Transaction.product_id == id,  # 👈 Specific Product Filter
+            Transaction.is_active == True,
+            Product.is_active == True,
+            or_(Supplier.id == None, Supplier.is_active == True),
+            or_(Contractor.id == None, Contractor.is_active == True)
+        )
+
+    # 4. Apply Date Filters
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d')
+            # Ensure we cover the full end day
+            end_date = end_date.replace(hour=23, minute=59, second=59)
+            query = query.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError:
+            pass
+
+    # 5. Execute
+    txns = query.order_by(desc(Transaction.created_at)).all()
+
+    # 6. Format Results (Exact match to Global History)
     results = []
     for t in txns:
         entity_name = "Manual Adjustment"
@@ -1054,18 +1140,14 @@ def get_product_transactions(id):
             "id": t.id,
             "date": t.created_at.strftime('%Y-%m-%d'),
             "type": t.type,
+            "product_id": t.product_id,
+            "product": t.product.name,
+            "sku": t.product.product_code,
             "qty": t.quantity,
             "entity": entity_name,
-            "is_active": t.is_active
+            "is_active": t.is_active,
+            "supplier_id": t.supplier_id,
+            "contractor_id": t.contractor_id
         })
 
-    return jsonify(results), 200     
-
-
-
-    
-
-
-
-
-
+    return jsonify(results), 200
