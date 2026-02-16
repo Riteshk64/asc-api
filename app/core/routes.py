@@ -780,15 +780,16 @@ def get_departments_by_id(id):
 @admin_only
 def add_department():
     data = request.get_json()
+    unit_val = data.get('unit', 'pcs')
 
-    if not data or 'name' not in data or 'permissions' not in data:
-        return jsonify({"error": "Name is required"}), 400
+    if not data or 'name' not in data or 'permissions' not in data or 'unit' not in data:
+        return jsonify({"error": "Name, permission or unit is required"}), 400
     
     if Department.query.filter_by(name=data['name']).first():
         return jsonify({"error": "Department already exists"}), 400
     
 
-    new_dept = Department(name=data['name'],permissions=data['permissions'], is_active=True)
+    new_dept = Department(name=data['name'], unit = data['unit'], permissions=data['permissions'], is_active=True)
     db.session.add(new_dept)
     db.session.commit()
     return jsonify({"message": "Department added", "department": new_dept.to_dict()}), 201
@@ -816,13 +817,65 @@ def update_department(id):
     if 'is_active' in data: 
         dept.is_active = data['is_active']
 
+    if 'unit' in data: 
+        dept.unit = data['unit']    
+
     try:
         db.session.commit()
         return jsonify({"message": "Department updated", "department": dept.to_dict()}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500   
+@core.route('/suppliers', methods=['POST'])
+@jwt_required
+def add_supplier():
+    data = request.get_json()
+    
+    # --- 1. Basic Validation ---
+    if not data.get('name'):
+        return jsonify({"error": "Supplier Name is required"}), 400
+        
+    phone = data.get('phone')
+    if phone:
+        # Remove spaces/dashes to check just digits
+        clean_phone = ''.join(filter(str.isdigit, str(phone)))
+        if len(clean_phone) != 10:
+            return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
+    
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
 
+    # --- 2. Check Duplicate ---
+    existing = Supplier.query.filter(
+        Supplier.name.ilike(data['name']), 
+        Supplier.department_id == active_dept
+    ).first()
+    
+    if existing:
+        if not existing.is_active:
+             return jsonify({"error": "Supplier exists but is in Recycle Bin. Restore it instead."}), 400
+        return jsonify({"error": "Supplier already exists"}), 400
+
+    # --- 3. Create ---
+    try:
+        new_supplier = Supplier(
+            name=data['name'],
+            phone_number=phone, 
+            department_id=active_dept,
+            is_active=True
+        )
+        db.session.add(new_supplier)
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Supplier added successfully", 
+            "supplier": new_supplier.to_dict()
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 @core.route('/suppliers', methods=['GET'])
 @jwt_required
@@ -861,7 +914,6 @@ def update_supplier(id):
 
 @core.route('/contractors/<int:id>', methods=['PUT'])
 @jwt_required
-@admin_only
 def update_contractor(id):
     contractor = Contractor.query.get(id)
     if not contractor:
@@ -887,12 +939,56 @@ def get_contractors():
     contractors = Contractor.query.filter_by(is_active=True).all()
     return jsonify([c.to_dict() for c in contractors]), 200
 
+@core.route('/contractors', methods=['POST'])
+@jwt_required
+def add_contractor():
+    data = request.get_json()
+
+    # --- 1. Basic Validation ---
+    if not data.get('name'):
+        return jsonify({"error": "Contractor Name is required"}), 400
+
+    phone = data.get('phone')
+    if phone:
+        # Remove spaces/dashes to check just digits
+        clean_phone = ''.join(filter(str.isdigit, str(phone)))
+        if len(clean_phone) != 10:
+            return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
+
+    # --- 2. Check Duplicate ---
+    existing = Contractor.query.filter(Contractor.name.ilike(data['name'])).first()
+    
+    if existing:
+        if not existing.is_active:
+             return jsonify({"error": "Contractor exists but is in Recycle Bin. Restore it instead."}), 400
+        return jsonify({"error": "Contractor already exists"}), 400
+
+    # --- 3. Create ---
+    try:
+        new_contractor = Contractor(
+            name=data['name'],
+            phone=phone, 
+            is_active=True
+        )
+        db.session.add(new_contractor)
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Contractor added successfully", 
+            "contractor": new_contractor.to_dict()
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
+
+
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
     data = request.get_json()
     sku = data.get('sku')
-    unit = data.get('unit')
     
     active_dept = get_active_department()
     if not active_dept:
@@ -904,7 +1000,6 @@ def add_product():
     new_p = Product(
         name=data['name'],
         product_code=sku,
-        unit=unit,
         category=data.get('category'),
         current_stock=0,
         department_id=active_dept,
