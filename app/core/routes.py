@@ -186,39 +186,103 @@ def get_products():
     return jsonify([p.to_dict() for p in products]), 200
 
 
+# @core.route('/products/<int:id>', methods=['PUT'])
+# @jwt_required
+# def update_product(id):
+#     product = Product.query.get(id)
+#     if not product: return jsonify({"error": "Product not found"}), 404
+
+#     active_dept = get_active_department()
+    
+#     # Security: Only Admin or Dept Owner can edit
+#     if product.department_id != active_dept and g.role != 'ADMIN':
+#         return jsonify({"error": "Unauthorized"}), 403
+
+#     data = request.get_json()
+    
+
+#     if 'name' in data: product.name = data['name']
+#     if 'sku' in data: product.product_code = data['sku']
+    
+
+#     if 'min_stock' in data: 
+#         try: product.min_stock = float(data['min_stock'])
+#         except: pass
+    
+#     if 'max_stock' in data:
+#         try: product.max_stock = float(data['max_stock'])
+#         except: pass
+
+#     try:
+#         db.session.commit()
+#         return jsonify({"message": "Product updated"}), 200
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"error": str(e)}), 500
+
 @core.route('/products/<int:id>', methods=['PUT'])
 @jwt_required
 def update_product(id):
-    product = Product.query.get(id)
-    if not product: return jsonify({"error": "Product not found"}), 404
-
-    active_dept = get_active_department()
-    
-    # Security: Only Admin or Dept Owner can edit
-    if product.department_id != active_dept and g.role != 'ADMIN':
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.get_json()
-    
-
-    if 'name' in data: product.name = data['name']
-    if 'sku' in data: product.product_code = data['sku']
-    
-
-    if 'min_stock' in data: 
-        try: product.min_stock = float(data['min_stock'])
-        except: pass
-    
-    if 'max_stock' in data:
-        try: product.max_stock = float(data['max_stock'])
-        except: pass
-
     try:
+        # 1. Find Product
+        product = Product.query.get(id)
+        if not product: 
+            return jsonify({"error": "Product not found"}), 404
+
+        active_dept = get_active_department()
+        
+        # 2. Security Check (Allow Admin OR Department Owner)
+        # Note: We check if role is NOT Admin AND Dept doesn't match
+        if g.role != 'ADMIN' and product.department_id != active_dept:
+            return jsonify({"error": "Unauthorized"}), 403
+
+        data = request.get_json()
+        
+        # 3. Update Name
+        if 'name' in data and data['name']:
+            product.name = data['name']
+
+        # 4. Update SKU (With Duplicate Check)
+        if 'sku' in data and data['sku']:
+            new_sku = data['sku'].strip()
+            # Only check if the SKU is actually changing
+            if new_sku != product.product_code:
+                # Check if this SKU exists elsewhere
+                existing = Product.query.filter_by(product_code=new_sku).first()
+                if existing:
+                    return jsonify({"error": f"SKU '{new_sku}' is already taken"}), 400
+                product.product_code = new_sku
+        
+        # 5. Update Min Stock (Safe Conversion)
+        if 'min_stock' in data: 
+            try: 
+                val = data['min_stock']
+                # Handle empty strings or nulls by defaulting to 0
+                if val == "" or val is None:
+                    product.min_stock = 0.0
+                else:
+                    product.min_stock = float(val)
+            except ValueError: 
+                pass # Ignore invalid numbers (keep old value)
+        
+        # 6. Update Max Stock (Safe Conversion)
+        if 'max_stock' in data:
+            try: 
+                val = data['max_stock']
+                if val == "" or val is None:
+                    product.max_stock = 0.0
+                else:
+                    product.max_stock = float(val)
+            except ValueError: 
+                pass 
+
         db.session.commit()
         return jsonify({"message": "Product updated"}), 200
+
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Update Product Error: {str(e)}") 
+        return jsonify({"error": f"Server Error: {str(e)}"}), 500
     
 @core.route('/transactions', methods=['GET'])
 @jwt_required
