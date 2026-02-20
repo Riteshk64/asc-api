@@ -169,7 +169,7 @@ def stock_operation():
     
   
 @core.route('/users/<int:id>', methods=['GET'])
-@jwt_required()
+@jwt_required
 @admin_only
 def get_user_details(id): 
     # Use .get() to find by primary key 'id'
