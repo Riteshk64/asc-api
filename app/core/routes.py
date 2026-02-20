@@ -3,7 +3,8 @@ from app.auth.jwt_middleware import jwt_required
 from app.common.decorators import admin_only
 from app.extensions import db
 from sqlalchemy import func, case, desc
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 from sqlalchemy.orm import joinedload
 from sqlalchemy import or_
 
@@ -185,40 +186,140 @@ def get_user_details(id):
 
     # is_admin=True ensures pay_type, base_pay, etc. are included in the dict
     return jsonify(user.to_dict(is_admin=True)), 200
-
-    
 @core.route('/users/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
-def update_user_payroll(id):
+def update_user_payroll_settings(id):
     user = User.query.get_or_404(id)
     data = request.json
-
-    # Update payroll fields
+    
+    # 1. Update Pay Type
     if 'pay_type' in data:
-        user.pay_type = data['pay_type'].upper() # FIXED, DAILY, HOURLY
-    if 'base_pay' in data:
-        user.base_pay = float(data['base_pay'])
-    if 'daily_required_hours' in data:
-        user.daily_required_hours = float(data['daily_required_hours'])
+        user.pay_type = data['pay_type'].upper()
+
+    # 2. Safety Logic for Float Conversions
+    # We use 'or 0.0' to handle cases where the DB or the Input is None
+    user.base_pay = float(data.get('base_pay') or user.base_pay or 0.0)
+    user.daily_required_hours = float(data.get('daily_required_hours') or user.daily_required_hours or 8.0)
+    user.overtime_rate = float(data.get('overtime_rate') or user.overtime_rate or 0.0)
+    
+    # 3. Update Boolean
     if 'overtime_eligible' in data:
         user.overtime_eligible = bool(data['overtime_eligible'])
-    if 'overtime_rate' in data:
-        user.overtime_rate = float(data['overtime_rate'])
+        
+    db.session.commit()
+    return jsonify({"message": "Settings updated"}), 200
 
-    # Standard fields
-    if 'first_name' in data: user.first_name = data['first_name']
-    if 'last_name' in data: user.last_name = data['last_name']
+@core.route('/attendance/log', methods=['POST'])
+@jwt_required
+@admin_only
+def calculate_monthly_payout():
+    data = request.json
+    worker = User.query.get_or_404(data.get('user_id'))
+    
+    # --- Month Selection & Duplicate Check Logic ---
+    month_year_str = data.get('month_year') 
+    if month_year_str:
+        try:
+            target_year, target_month = map(int, month_year_str.split('-'))
+        except ValueError:
+            return jsonify({"error": "Invalid month format. Use YYYY-MM"}), 400
+    else:
+        today = datetime.utcnow().date()
+        target_year, target_month = today.year, today.month
+        
+    first_day_of_month = date(target_year, target_month, 1)
+    last_day_num = calendar.monthrange(target_year, target_month)[1]
+    pay_period_date = date(target_year, target_month, last_day_num)
 
+    existing_entry = Attendance.query.filter(
+        Attendance.user_id == worker.id,
+        Attendance.status == 'MONTHLY_SUMMARY',
+        Attendance.date >= first_day_of_month,
+        Attendance.date <= pay_period_date
+    ).first()
+
+    if existing_entry:
+        return jsonify({
+            "error": f"A payroll entry for {target_year}-{target_month:02d} already exists. Please delete it first if you need to amend it."
+        }), 400
+
+    # --- Calculations ---
+    base_pay = float(worker.base_pay or 0.0)
+    shift_hrs = float(worker.daily_required_hours or 8.0)
+    
+    # Inputs
+    standard_days = float(data.get('standard_days', 27))
+    actual_days = float(data.get('actual_days', 0))
+    
+    standard_hours = float(data.get('standard_hours', 216))
+    actual_hours = float(data.get('actual_hours', 0))
+    
+    ot_hrs = float(data.get('overtime_hours', 0))
+    
+    final_payout = 0.0
+    total_hours_logged = 0.0
+    hourly_rate_at_time = 0.0
+
+    if worker.pay_type == 'FIXED':
+        final_payout = base_pay
+        total_hours_logged = standard_days * shift_hrs 
+        hourly_rate_at_time = (base_pay / standard_days) / shift_hrs if standard_days > 0 and shift_hrs > 0 else 0
+    
+    elif worker.pay_type == 'HOURLY':
+        # Rate = Base / Standard Expected Hours
+        hourly_rate = base_pay / standard_hours if standard_hours > 0 else 0
+        total_hours_logged = actual_hours + ot_hrs
+        
+        # Payout = Total actual hours * rate
+        final_payout = total_hours_logged * hourly_rate
+        hourly_rate_at_time = hourly_rate
+
+    elif worker.pay_type == 'DAILY':
+        # Rate = Base / Standard Expected Days
+        daily_rate = base_pay / standard_days if standard_days > 0 else 0
+        hourly_conv = daily_rate / shift_hrs if shift_hrs > 0 else 0
+        total_hours_logged = (actual_days * shift_hrs) + ot_hrs
+        
+        # Payout = (Actual days * daily rate) + OT
+        final_payout = (actual_days * daily_rate) + (ot_hrs * hourly_conv)
+        hourly_rate_at_time = hourly_conv
+
+    # --- Save ---
     try:
+        new_summary = Attendance(
+            user_id=worker.id,
+            date=pay_period_date, 
+            status='MONTHLY_SUMMARY',
+            hours_worked=total_hours_logged,
+            overtime_hours=ot_hrs,
+            logged_pay_type=worker.pay_type,
+            total_daily_earnings=round(final_payout, 2),
+            hourly_rate_at_time=round(hourly_rate_at_time, 4),
+            created_by=g.current_user.id if hasattr(g, 'current_user') else None
+        )
+        db.session.add(new_summary)
         db.session.commit()
-        return jsonify({"message": "User payroll settings updated successfully"}), 200
+        
+        return jsonify({"message": "Payout recorded", "earned": round(final_payout, 2)}), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+@core.route('/attendance/<int:log_id>', methods=['DELETE'])
+@jwt_required
+@admin_only
+def delete_attendance_log(log_id):
+    log = Attendance.query.get_or_404(log_id)
     
-
-
+    try:
+        db.session.delete(log)
+        db.session.commit()
+        return jsonify({"message": "Payroll record deleted successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 @core.route('/users/<int:id>/attendance', methods=['GET'])
 @jwt_required
@@ -315,9 +416,6 @@ def update_product(id):
             # Only check if the SKU is actually changing
             if new_sku != product.product_code:
                 # Check if this SKU exists elsewhere
-                existing = Product.query.filter_by(product_code=new_sku).first()
-                if existing:
-                    return jsonify({"error": f"SKU '{new_sku}' is already taken"}), 400
                 product.product_code = new_sku
         
         # 5. Update Min Stock (Safe Conversion)
@@ -1045,7 +1143,9 @@ def update_department(id):
         return jsonify({"message": "Department updated", "department": dept.to_dict()}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500   
+        return jsonify({"error": str(e)}), 500  
+
+
 @core.route('/suppliers', methods=['POST'])
 @jwt_required
 def add_supplier():
@@ -1097,6 +1197,58 @@ def add_supplier():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+
+@core.route('/supplier-transactions', methods=['GET'])
+@jwt_required
+def supplier_transaction_report():
+
+    # --- 1. Get Active Department ---
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
+    try:
+        # --- 2. Query Transactions ---
+        transactions = (
+            db.session.query(Transaction)
+            .filter(
+                Transaction.department_id == active_dept,
+                Transaction.type == 'in',
+                Transaction.is_active == True,
+                Transaction.supplier_id.isnot(None)
+            )
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+
+        if not transactions:
+            return jsonify([]), 200
+
+        # --- 3. Format Response ---
+        result = []
+
+        for txn in transactions:
+            supplier = Supplier.query.get(txn.supplier_id)
+            product = Product.query.get(txn.product_id)
+
+            if not supplier or not product:
+                continue  # Skip corrupted data safely
+
+            result.append({
+                "supplier": supplier.name,
+                "supplier_id": supplier.id,
+                "product": product.name,
+                "product_id": product.id,
+                "sku": product.product_code,
+                "unit": product.unit,
+                "date": txn.created_at.strftime("%Y-%m-%d"),
+                "qty": txn.quantity
+            })
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 @core.route('/suppliers', methods=['GET'])
 @jwt_required
 def get_suppliers():
@@ -1213,9 +1365,6 @@ def add_product():
     active_dept = get_active_department()
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
-
-    if Product.query.filter_by(product_code=sku).first():
-        return jsonify({"error": "SKU exists"}), 400
 
     new_p = Product(
         name=data['name'],

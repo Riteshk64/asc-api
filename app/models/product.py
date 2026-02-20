@@ -13,10 +13,11 @@ class Product(db.Model):
     min_stock = db.Column(db.Float, default=10.0)
     max_stock = db.Column(db.Float, default=100.0)
     is_active = db.Column(db.Boolean, default=True)
+    unit = db.Column(db.String(20), default='pcs')
 
     def to_dict(self):
         return {
             "id": self.id, "name": self.name, "sku": self.product_code, "qty": self.current_stock,
             "is_active": self.is_active, 'min_stock': self.min_stock,  
-            'max_stock': self.max_stock,
+            'max_stock': self.max_stock, "unit": self.unit
         }
