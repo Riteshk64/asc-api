@@ -1,0 +1,22 @@
+name: Keep Supabase Alive
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9am UTC
+    - cron: '0 9 * * 4'  # Every Thursday at 9am UTC
+  workflow_dispatch:      # Allow manual trigger
+
+jobs:
+  ping-db:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase DB
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/?apikey=${{ secrets.SUPABASE_ANON_KEY }}")
+          echo "Response code: $response"
+          if [ "$response" -ne 200 ]; then
+            echo "Ping failed with status $response"
+            exit 1
+          fi
+          echo "Ping successful!"
