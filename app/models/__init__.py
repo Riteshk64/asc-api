@@ -5,3 +5,4 @@ from .contractor import Contractor
 from .product import Product
 from .transaction import Transaction
 from .activity_log import ActivityLog
+from .attendance import Attendance

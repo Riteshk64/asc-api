@@ -15,6 +15,7 @@ from app.models.product import Product
 from app.models.transaction import Transaction
 from app.models.user import User  
 from app.models.activity_log import ActivityLog
+from app.models.attendance import Attendance
 
 core = Blueprint('core', __name__, url_prefix='/core')
 
@@ -165,8 +166,73 @@ def stock_operation():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
+  
+@core.route('/users/<int:id>', methods=['GET'])
+@jwt_required()
+@admin_only
+def get_user_details(id): 
+    # Use .get() to find by primary key 'id'
+    user = User.query.get(id)
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # Security: Ensure Admin has access to this user's department
+    active_dept = get_active_department()
+    if active_dept and user.department_id != active_dept:
+        return jsonify({"error": "Unauthorized: This user belongs to another department"}), 403
+
+    # is_admin=True ensures pay_type, base_pay, etc. are included in the dict
+    return jsonify(user.to_dict(is_admin=True)), 200
+
+    
+@core.route('/users/<int:id>', methods=['PUT'])
+@jwt_required
+@admin_only
+def update_user_payroll(id):
+    user = User.query.get_or_404(id)
+    data = request.json
+
+    # Update payroll fields
+    if 'pay_type' in data:
+        user.pay_type = data['pay_type'].upper() # FIXED, DAILY, HOURLY
+    if 'base_pay' in data:
+        user.base_pay = float(data['base_pay'])
+    if 'daily_required_hours' in data:
+        user.daily_required_hours = float(data['daily_required_hours'])
+    if 'overtime_eligible' in data:
+        user.overtime_eligible = bool(data['overtime_eligible'])
+    if 'overtime_rate' in data:
+        user.overtime_rate = float(data['overtime_rate'])
+
+    # Standard fields
+    if 'first_name' in data: user.first_name = data['first_name']
+    if 'last_name' in data: user.last_name = data['last_name']
+
+    try:
+        db.session.commit()
+        return jsonify({"message": "User payroll settings updated successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
 
 
+
+@core.route('/users/<int:id>/attendance', methods=['GET'])
+@jwt_required
+@admin_only
+def get_user_attendance_history(id):
+    worker = User.query.get(id)
+    if not worker:
+        return jsonify({"error": "Worker not found"}), 404
+
+    # Fetch logs ordered by date (newest first)
+    # The .attendance_records relationship uses the user_id foreign key we specified
+    logs = Attendance.query.filter_by(user_id=id).order_by(desc(Attendance.date)).all()
+
+    return jsonify([log.to_dict() for log in logs]), 200
 
 # ==========================================
 # 2. LISTS (Products & Transactions)
@@ -184,6 +250,7 @@ def get_products():
     ).all()
 
     return jsonify([p.to_dict() for p in products]), 200
+
 
 
 # @core.route('/products/<int:id>', methods=['PUT'])
@@ -284,6 +351,95 @@ def update_product(id):
         print(f"Update Product Error: {str(e)}") 
         return jsonify({"error": f"Server Error: {str(e)}"}), 500
     
+@core.route('/pending-users', methods=['GET'])
+@jwt_required
+@admin_only
+def get_pending_users():
+    active_dept = get_active_department()
+    
+    query = User.query.filter(User.is_active == False, User.role != 'ADMIN', User.department_id != None)
+    
+    if active_dept:
+        query = query.filter(User.department_id == active_dept)
+        
+    pending_users = query.order_by(desc(User.created_at)).all()
+    
+    results = []
+    for user in pending_users:
+       
+        if not user.department_id:
+            return jsonify({
+                "error": f"Data Integrity Error: Pending worker {user.first_name} ({user.phoneno}) has no department assigned."
+            }), 400
+            
+
+        dept = Department.query.get(user.department_id)
+        if not dept:
+            return jsonify({
+                "error": f"Data Integrity Error: Department ID {user.department_id} for worker {user.first_name} does not exist."
+            }), 400
+            
+        user_dict = user.to_dict(is_admin=True) 
+        user_dict['department_name'] = dept.name
+        results.append(user_dict)
+        
+    return jsonify(results), 200    
+    
+@core.route('/approve-user', methods=['POST'])
+@jwt_required
+@admin_only
+def approve_user():
+    data = request.json
+    target_user_id = data.get('id')
+    phone = data.get('phone')
+    is_approved = data.get('approved')
+
+    # Basic validation
+    if not target_user_id or phone is None or is_approved is None:
+        return jsonify({"error": "Missing required fields (id, phone, approved)"}), 400
+
+    # Fetch the pending user using both ID and phone for security
+    target_user = User.query.filter_by(id=target_user_id, phoneno=phone).first()
+
+    if not target_user:
+        return jsonify({"error": "Pending user not found or phone number mismatch"}), 404
+
+    try:
+        if is_approved:
+            # Activate the user so they can log in
+            target_user.is_active = True
+            db.session.commit()
+            return jsonify({"message": f"User {target_user.first_name} has been approved."}), 200
+        else:
+            # Reject and delete the user so they can try registering again if needed
+            db.session.delete(target_user)
+            db.session.commit()
+            return jsonify({"message": "User registration rejected and removed."}), 200
+            
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "Database operation failed", "details": str(e)}), 500   
+ 
+@core.route('/users', methods=['GET'])
+@jwt_required
+@admin_only
+def get_users():    
+    # Check if a specific department was passed in the query parameters or headers
+    # (Adjust this to match how get_active_department() works in your app)
+    dept_id = get_active_department()
+    
+    query = User.query
+
+    
+    if dept_id:
+        query = query.filter(User.department_id == dept_id)
+        
+    
+    users = query.order_by(User.first_name.asc()).all()
+
+    # Pass is_admin=True so the frontend gets the payroll configuration data
+    return jsonify([user.to_dict(is_admin=True) for user in users]), 200
+
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 @admin_only

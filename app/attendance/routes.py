@@ -1,88 +1,97 @@
-import io
-import base64
-import pandas as pd
-from flask import request, jsonify
-from app.auth.jwt_middleware import jwt_required
-from app.common.decorators import admin_only
-from .processor import extract_raw_attendance, calculate_payroll, normalize_id
-from . import attendance
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from datetime import datetime
+from app.extensions import db
+from app.models import User, Attendance
 
-def get_col_name(df, candidates):
-    """
-    Helper to find a column name in the dataframe that matches one of the candidates.
-    Case-insensitive.
-    """
-    cols = [str(c).lower().strip() for c in df.columns]
-    for cand in candidates:
-        if cand in cols:
-            # Return the actual column name from the dataframe
-            return df.columns[cols.index(cand)]
-    return None
 
-@attendance.route('/calculate-payroll', methods=['POST'])
-@jwt_required
-@admin_only
-def calculate_payroll_route():
-    if 'attendance_file' not in request.files or 'master_file' not in request.files:
-        return jsonify({"error": "Missing files. Please upload both Attendance and Master files."}), 400
-        
+attendance = Blueprint('attendance', __name__, url_prefix='/attendance')
+
+@attendance.route('/log', methods=['POST'])
+@jwt_required()
+def log_attendance():
+    admin_id = get_jwt_identity()
+    admin = User.query.get(admin_id)
+
+    # 1. SECURITY: Only Admins can log attendance
+    if not admin or admin.role.upper() != 'ADMIN':
+        return jsonify({"error": "Unauthorized. Admins only."}), 403
+
+    data = request.json
+    user_id = data.get('user_id')
+    date_str = data.get('date') # Expected format: 'YYYY-MM-DD'
+    status = data.get('status', 'PRESENT').upper()
+    hours_worked = float(data.get('hours_worked', 0.0))
+    overtime_hours = float(data.get('overtime_hours', 0.0))
+
+    worker = User.query.get(user_id)
+    if not worker:
+        return jsonify({"error": "Worker not found"}), 404
+
     try:
-        att_file = request.files['attendance_file']
-        master_file = request.files['master_file']
-        
-        # 1. Parse Master File
-        master_df = pd.read_excel(master_file)
-        
-        # Identify Columns intelligently
-        id_col = get_col_name(master_df, ['id', 'emp_id', 'emp id', 'code', 'emp code'])
-        salary_col = get_col_name(master_df, ['salary', 'monthly_salary', 'monthly salary', 'basic', 'stipend', 'amount'])
-        hours_col = get_col_name(master_df, ['hours', 'daily_hours', 'daily hours', 'req_hours', 'shift hours'])
-        ot_col = get_col_name(master_df, ['ot_mult', 'overtime_multiplier', 'ot rate'])
-        
-        if not id_col:
-            return jsonify({"error": "Could not find an 'ID' column in the Master file."}), 400
-            
-        ref_map = {}
-        for _, row in master_df.iterrows():
-            raw_id = row[id_col]
-            if pd.isna(raw_id): continue
-            
-            clean_id = normalize_id(raw_id)
-            
-            # Extract values using the detected column names
-            # Default Salary to 0, Hours to 9 (since you mentioned 9*30=270 mostly)
-            salary_val = row[salary_col] if salary_col else 0
-            hours_val = row[hours_col] if hours_col else 0 
-            ot_val = row[ot_col] if ot_col else 1.5
+        log_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
 
-            ref_map[clean_id] = {
-                'salary': salary_val,
-                'hours': hours_val,
-                'ot_mult': ot_val
-            }
-            
-        # 2. Process Attendance
-        raw_data = extract_raw_attendance(att_file)
-        
-        # 3. Calculate Logic
-        result_df = calculate_payroll(raw_data, ref_map)
-        
-        if result_df.empty:
-             return jsonify({"error": "No matching employees found. Check if IDs in Master file match Attendance file."}), 400
+    # 2. THE MATH ENGINE
+    daily_base_earnings = 0.0
+    daily_overtime_earnings = 0.0
 
-        # 4. Prepare Response
-        ui_data = result_df.to_dict(orient='records')
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            result_df.to_excel(writer, index=False, sheet_name='Payroll')
-        output.seek(0)
-        b64_data = base64.b64encode(output.read()).decode('utf-8')
-        
-        return jsonify({
-            "results": ui_data,
-            "excel_file": b64_data
-        })
+    # Calculate Overtime (if eligible)
+    if worker.overtime_eligible and overtime_hours > 0:
+        daily_overtime_earnings = overtime_hours * worker.overtime_rate
 
-    except Exception as e:
-        return jsonify({"error": f"Server Error: {str(e)}"}), 500
+    # Calculate Base Earnings based on Pay Type
+    if status == 'PRESENT':
+        if worker.pay_type == 'HOURLY':
+            daily_base_earnings = hours_worked * worker.base_pay
+        elif worker.pay_type == 'DAILY':
+            daily_base_earnings = worker.base_pay
+        # If 'FIXED', daily_base_earnings remains 0.0 (monthly salary handles their base pay)
+
+    elif status == 'HALF_DAY':
+        if worker.pay_type == 'HOURLY':
+            daily_base_earnings = hours_worked * worker.base_pay
+        elif worker.pay_type == 'DAILY':
+            daily_base_earnings = worker.base_pay / 2.0
+        # For 'FIXED', you might handle half-day deductions at the end of the month
+
+    total_daily_earnings = daily_base_earnings + daily_overtime_earnings
+
+    # 3. UPSERT LOGIC (Update if exists, else Create)
+    existing_log = Attendance.query.filter_by(user_id=worker.id, date=log_date).first()
+
+    if existing_log:
+        existing_log.status = status
+        existing_log.hours_worked = hours_worked
+        existing_log.overtime_hours = overtime_hours
+        existing_log.logged_pay_type = worker.pay_type
+        existing_log.hourly_rate_at_time = worker.base_pay
+        existing_log.overtime_rate_at_time = worker.overtime_rate
+        existing_log.daily_base_earnings = daily_base_earnings
+        existing_log.daily_overtime_earnings = daily_overtime_earnings
+        existing_log.total_daily_earnings = total_daily_earnings
+        existing_log.created_by = admin.id
+    else:
+        new_log = Attendance(
+            user_id=worker.id,
+            date=log_date,
+            status=status,
+            hours_worked=hours_worked,
+            overtime_hours=overtime_hours,
+            logged_pay_type=worker.pay_type,
+            hourly_rate_at_time=worker.base_pay,
+            overtime_rate_at_time=worker.overtime_rate,
+            daily_base_earnings=daily_base_earnings,
+            daily_overtime_earnings=daily_overtime_earnings,
+            total_daily_earnings=total_daily_earnings,
+            created_by=admin.id
+        )
+        db.session.add(new_log)
+
+    db.session.commit()
+
+    return jsonify({
+        "message": "Attendance logged successfully",
+        "total_earnings_today": total_daily_earnings
+    }), 200
