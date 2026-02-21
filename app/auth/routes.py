@@ -13,13 +13,8 @@ from flask import g
 
 auth = Blueprint('auth', __name__, url_prefix='/auth')
 
-# app/auth/routes.py
-
 @jwt_required
 def get_department_name(dept_id, role):
-
-    
-
     if dept_id: 
         dept = Department.query.get(dept_id)
         if dept: 
@@ -66,7 +61,8 @@ def get_current_user():
         "role": user.role,               
         "department_id": user.department_id, 
         "department_name": department_name,
-        "allowed_menus": allowed_menus
+        "allowed_menus": allowed_menus,
+        "is_active": user.current_user.is_active
     }), 200
 
 @auth.route("/verify-phone", methods=["POST"])
@@ -139,30 +135,21 @@ def create_profile():
     last_name = data.get("last_name")
     dept_input = data.get("department_id")
 
-    
+    # Use the environment variable to identify the Admin
     admin_phone_env = os.environ.get("ADMIN_PHONE", "")
 
     if admin_phone_env and phone == admin_phone_env:
-        
         final_role = "ADMIN"
         final_dept_id = None 
-        print(f"👑 Admin identified: {phone}")
-
+        is_active = True  # 👑 Admins bypass approval
     else:
-       
         final_role = "USER"
         final_dept_id = dept_input
+        is_active = False # 🔒 Workers are locked by default
         
-    
+        # Regular users MUST have a department
         if not final_dept_id:
-            return jsonify({"message": "Regular users must select a department"}), 400
-
-
-        dept = Department.query.get(final_dept_id)
-        if not dept:
-            return jsonify({"message": "Invalid Department ID Selected"}), 400
-
-    
+            return jsonify({"message": "Department selection is mandatory"}), 400
 
     user = User(
         first_name=first_name,
@@ -170,6 +157,7 @@ def create_profile():
         phoneno=phone,
         role=final_role,
         department_id=final_dept_id,
+        is_active=is_active # 👈 This is the master lock
     )
 
     try:
@@ -180,16 +168,15 @@ def create_profile():
         return jsonify({"message": "Error creating profile", "error": str(e)}), 500
 
     token = generate_jwt(
-        {
-            "user_id": user.id,
-            "role": user.role,
-            "department_id": user.department_id,
-            "profile_complete": True
-        },
+        {"user_id": user.id, "role": user.role, "profile_complete": True},
         expires_in_minutes=60 * 24 * 7
     )
 
-    return jsonify({"token": token, "role": final_role})
+    return jsonify({
+        "token": token, 
+        "role": final_role, 
+        "is_active": is_active # 👈 Frontend uses this for the guard
+    })
 
 
 @auth.route("/profile/update", methods=["PUT"])
