@@ -436,11 +436,24 @@ def get_user_attendance_history(id):
     if not worker:
         return jsonify({"error": "Worker not found"}), 404
 
-    # Fetch logs ordered by date (newest first)
-    # The .attendance_records relationship uses the user_id foreign key we specified
-    logs = Attendance.query.filter_by(user_id=id).order_by(desc(Attendance.date)).all()
+    # OPTIMIZED: Add pagination to avoid loading all records at once
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    per_page = min(per_page, 100)  # Cap at 100 to prevent abuse
 
-    return jsonify([log.to_dict() for log in logs]), 200
+    # Fetch logs with pagination, ordered by date (newest first)
+    query = Attendance.query.filter_by(user_id=id).order_by(desc(Attendance.date))
+    paginated = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        "data": [log.to_dict() for log in paginated.items],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": paginated.total,
+            "pages": paginated.pages
+        }
+    }), 200
 
 # ==========================================
 # 2. LISTS (Products & Transactions)
@@ -651,10 +664,15 @@ def get_users():
 def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    
+    # OPTIMIZED: Add pagination to prevent loading massive datasets
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    per_page = min(per_page, 100)  # Cap at 100
 
     active_dept = get_active_department()
 
-    # Base Query
+    # Base Query with eager loading via joins
     query = Transaction.query\
         .join(Product)\
         .outerjoin(Supplier)\
@@ -678,10 +696,11 @@ def get_transactions():
         except ValueError:
             pass
 
-    txns = query.order_by(desc(Transaction.created_at)).all()
+    # Apply pagination
+    paginated = query.order_by(desc(Transaction.created_at)).paginate(page=page, per_page=per_page, error_out=False)
     
     results = []
-    for t in txns:
+    for t in paginated.items:
         entity_display = ""
         
         if t.type == 'in':
@@ -711,7 +730,15 @@ def get_transactions():
             "contractor_id": t.contractor_id
         })
 
-    return jsonify(results), 200
+    return jsonify({
+        "data": results,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": paginated.total,
+            "pages": paginated.pages
+        }
+    }), 200
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
@@ -1739,6 +1766,11 @@ def get_product_transactions(id):
     if not product:
         return jsonify({"error": "Product not found"}), 404
 
+    # OPTIMIZED: Add pagination
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    per_page = min(per_page, 100)  # Cap at 100
+
     # 2. Get Date Filters from Query Params
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
@@ -1767,12 +1799,12 @@ def get_product_transactions(id):
         except ValueError:
             pass
 
-    # 5. Execute
-    txns = query.order_by(desc(Transaction.created_at)).all()
+    # 5. Execute with pagination
+    paginated = query.order_by(desc(Transaction.created_at)).paginate(page=page, per_page=per_page, error_out=False)
 
     # 6. Format Results (Exact match to Global History)
     results = []
-    for t in txns:
+    for t in paginated.items:
         entity_name = "Manual Adjustment"
         if t.type == 'in' and t.supplier:
             entity_name = f"Supplier: {t.supplier.name}"
@@ -1797,4 +1829,12 @@ def get_product_transactions(id):
             "contractor_id": t.contractor_id
         })
 
-    return jsonify(results), 200
+    return jsonify({
+        "data": results,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": paginated.total,
+            "pages": paginated.pages
+        }
+    }), 200

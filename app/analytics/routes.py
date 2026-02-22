@@ -51,34 +51,33 @@ def get_dashboard_metrics():
     response = {}
     
     # ==========================================
-    # 0. HIGH LEVEL STATS (Always return these)
+    # 0. HIGH LEVEL STATS (Combined Query)
     # ==========================================
     
-    # Current Stock (Product Table)
-    stock_query = Product.query.filter(Product.is_active == True)
-    if active_dept:
-        stock_query = stock_query.filter(Product.department_id == active_dept)
+    # OPTIMIZED: Single combined query for all transaction metrics instead of 3 separate queries
+    txn_stats = db.session.query(
+        Transaction.type,
+        func.sum(Transaction.quantity).label('total_qty')
+    ).filter(*filters).group_by(Transaction.type).all()
     
-    total_stock = db.session.query(func.sum(Product.current_stock)).filter(
-        Product.department_id == active_dept if active_dept else True
-    ).scalar() or 0
-
-    # Transactions (In, Out, Return) - Using the filters built above (Date/Dept)
-    total_in = db.session.query(func.sum(Transaction.quantity)).filter(*filters).filter(Transaction.type == 'in').scalar() or 0
-    total_out = db.session.query(func.sum(Transaction.quantity)).filter(*filters).filter(Transaction.type == 'out').scalar() or 0
-    total_returned = db.session.query(func.sum(Transaction.quantity)).filter(*filters).filter(Transaction.type == 'return').scalar() or 0
+    # Convert results to dict for easy lookup
+    txn_dict = {row.type: float(row.total_qty or 0) for row in txn_stats}
     
-    low_stock_count = Product.query.filter(
-        Product.current_stock <= Product.min_stock,
+    # Stock aggregation - single query
+    stock_stats = db.session.query(
+        func.sum(Product.current_stock).label('total_stock'),
+        func.count(func.case((Product.current_stock <= Product.min_stock, 1))).label('low_stock_count')
+    ).filter(
+        Product.is_active == True,
         Product.department_id == active_dept if active_dept else True
-    ).count()
-
+    ).first()
+    
     response.update({
-        "total_stock": total_stock,
-        "total_in": total_in,
-        "total_out": total_out,
-        "total_returned": total_returned,
-        "low_stock_count": low_stock_count
+        "total_stock": float(stock_stats.total_stock or 0) if stock_stats else 0,
+        "total_in": txn_dict.get('in', 0),
+        "total_out": txn_dict.get('out', 0),
+        "total_returned": txn_dict.get('return', 0),
+        "low_stock_count": stock_stats.low_stock_count if stock_stats else 0
     })
 
     # ==========================================

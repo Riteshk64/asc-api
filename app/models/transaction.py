@@ -21,11 +21,11 @@ class Transaction(db.Model):
     is_active = db.Column(db.Boolean, default=True) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    # Relationships
-    product = db.relationship('Product', backref='transactions')
-    supplier = db.relationship('Supplier')
-    contractor = db.relationship('Contractor')
-    user = db.relationship('User')
+    # Relationships - use lazy='joined' for frequently accessed relations
+    product = db.relationship('Product', backref='transactions', lazy='joined')
+    supplier = db.relationship('Supplier', lazy='joined')
+    contractor = db.relationship('Contractor', lazy='joined')
+    user = db.relationship('User', lazy='joined')
 
     def to_dict(self):
         entity = "Adjustment"

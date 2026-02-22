@@ -27,6 +27,9 @@ class Attendance(db.Model):
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True) # Admin who logged it
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    # Eager load user to avoid N+1 queries
+    user = db.relationship('User', foreign_keys=[user_id], lazy='joined', primaryjoin='Attendance.user_id==User.id')
+
     def to_dict(self):
         return {
             "id": self.id,
