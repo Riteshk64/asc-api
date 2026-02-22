@@ -6,6 +6,7 @@ class Attendance(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True, index=True)
     date = db.Column(db.Date, nullable=False, index=True)
     status = db.Column(db.String(20), default='PRESENT') # 'PRESENT', 'ABSENT', 'HALF_DAY'
 

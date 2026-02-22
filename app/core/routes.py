@@ -396,6 +396,7 @@ def calculate_monthly_payout():
     try:
         new_summary = Attendance(
             user_id=worker.id,
+            department_id=worker.department_id,
             date=pay_period_date, 
             status='MONTHLY_SUMMARY',
             hours_worked=total_hours_logged,
