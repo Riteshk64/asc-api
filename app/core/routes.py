@@ -664,6 +664,11 @@ def get_users():
 def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    
+    # OPTIMIZED: Add pagination to prevent loading massive datasets
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    per_page = min(per_page, 100)  # Cap at 100
 
     active_dept = get_active_department()
 
@@ -691,11 +696,11 @@ def get_transactions():
         except ValueError:
             pass
 
-    # Execute and return full list (ordered newest first)
-    txns = query.order_by(desc(Transaction.created_at)).all()
-
+    # Apply pagination
+    paginated = query.order_by(desc(Transaction.created_at)).paginate(page=page, per_page=per_page, error_out=False)
+    
     results = []
-    for t in txns:
+    for t in paginated.items:
         entity_display = ""
         
         if t.type == 'in':
@@ -725,7 +730,15 @@ def get_transactions():
             "contractor_id": t.contractor_id
         })
 
-    return jsonify(results), 200
+    return jsonify({
+        "data": results,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": paginated.total,
+            "pages": paginated.pages
+        }
+    }), 200
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
