@@ -243,17 +243,54 @@ def stock_operation():
 
     if op_type == 'in':
         product.current_stock += qty
-        # ... (rest of your supplier logic remains the same)
+        sup_name = (data.get('supplier_name') or default_name).strip()
+        supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+        if not supplier:
+            supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+            db.session.add(supplier)
+            db.session.flush()
+        supplier_id = supplier.id
+        
     elif op_type == 'out':
         if product.current_stock < qty:
             return jsonify({"error": f"Insufficient stock ({product.current_stock})"}), 400
         product.current_stock -= qty
-        # ... (rest of your contractor logic remains the same)
+        cont_name = (data.get('contractor_name') or default_name).strip()
+        contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+        if not contractor:
+            contractor = Contractor(name=cont_name, is_active=True)
+            db.session.add(contractor)
+            db.session.flush()
+        contractor_id = contractor.id
+
     elif op_type == 'return':
-        if data.get('supplier_name'): # Return to supplier
-            product.current_stock -= qty
-        else: # Return from contractor
-            product.current_stock += qty
+        
+        # Scenario A: Returning defective stock TO a Supplier
+        if data.get('supplier_name'):
+            if product.current_stock < qty:
+                return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
+            
+            product.current_stock -= qty  # Stock goes DOWN
+            sup_name = data.get('supplier_name').strip()
+            
+            supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+            if not supplier:
+                supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+                db.session.add(supplier)
+                db.session.flush()
+            supplier_id = supplier.id
+
+        # Scenario B: Receiving unused stock FROM a Contractor
+        else:
+            product.current_stock += qty  # Stock goes UP
+            cont_name = (data.get('contractor_name') or default_name).strip()
+            
+            contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+            if not contractor:
+                contractor = Contractor(name=cont_name, is_active=True)
+                db.session.add(contractor)
+                db.session.flush()
+            contractor_id = contractor.id
 
     # Create Transaction using the correct product.id
     txn = Transaction(
