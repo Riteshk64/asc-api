@@ -27,7 +27,6 @@ def get_department_name(dept_id, role):
     else: 
         return "Unknown"
     
-
 @auth.route("/my-details", methods=["GET"])
 @jwt_required
 def get_current_user():
@@ -62,7 +61,9 @@ def get_current_user():
         "department_id": user.department_id, 
         "department_name": department_name,
         "allowed_menus": allowed_menus,
-        "is_active": user.current_user.is_active
+        "is_active": user.current_user.is_active,
+        "approval_status": user.current_user.approval_status,
+        "requested_department_id": user.current_user.requested_department_id
     }), 200
 
 @auth.route("/verify-phone", methods=["POST"])
@@ -141,11 +142,13 @@ def create_profile():
     if admin_phone_env and phone == admin_phone_env:
         final_role = "ADMIN"
         final_dept_id = None 
-        is_active = True  # 👑 Admins bypass approval
+        is_active = True
+        approval_status = "APPROVED"
     else:
         final_role = "USER"
         final_dept_id = dept_input
-        is_active = False # 🔒 Workers are locked by default
+        is_active = False
+        approval_status = "PENDING_SIGNUP"
         
         # Regular users MUST have a department
         if not final_dept_id:
@@ -157,7 +160,8 @@ def create_profile():
         phoneno=phone,
         role=final_role,
         department_id=final_dept_id,
-        is_active=is_active # 👈 This is the master lock
+        is_active=is_active,
+        approval_status=approval_status
     )
 
     try:
@@ -177,7 +181,6 @@ def create_profile():
         "role": final_role, 
         "is_active": is_active # 👈 Frontend uses this for the guard
     })
-
 
 @auth.route("/profile/update", methods=["PUT"])
 @jwt_required
@@ -208,13 +211,14 @@ def update_profile():
                 if not dept:
                     return jsonify({"error": "Invalid Department ID"}), 400
 
-                user.department_id = new_dept_id
-                user.is_active = False  # LOCK ACCOUNT
+                user.requested_department_id = new_dept_id
+                user.approval_status = "PENDING_DEPT_CHANGE"
+                # Keep is_active = True (user can still use app)
                 
                 db.session.commit()
                 return jsonify({
-                    "message": "Department changed. Account locked pending approval.",
-                    "is_active": False
+                    "message": "Department change requested. Waiting for admin approval.",
+                    "approval_status": "PENDING_DEPT_CHANGE"
                 }), 200
 
         except (ValueError, TypeError):
@@ -237,5 +241,3 @@ def update_profile():
 @auth.route("/test")
 def test():
     return jsonify({"message": "Auth route is working!"})
-
-

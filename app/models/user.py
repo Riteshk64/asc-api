@@ -88,7 +88,9 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False, default='WORKER') # 'ADMIN' or 'WORKER'
 
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
-    is_active = db.Column(db.Boolean, default=True)
+    approval_status = db.Column(db.String(20), default='APPROVED')  # 'APPROVED', 'PENDING_SIGNUP', 'PENDING_DEPT_CHANGE'
+    requested_department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
+    is_active = db.Column(db.Boolean, default=True) # Keep is_active as is (for admin deactivation toggle)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     # --- NEW: ROBUST PAYROLL MAPPING ---
@@ -120,7 +122,9 @@ class User(db.Model):
             "role": self.role,
             "department_id": self.department_id,
             "attendance_id": self.attendance_id,
-            "is_active": self.is_active
+            "is_active": self.is_active,
+            "approval_status": self.approval_status,
+            "requested_department_id": self.requested_department_id,
         }
 
         if is_admin:
