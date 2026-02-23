@@ -6,7 +6,7 @@ from sqlalchemy import func, case, desc
 from datetime import datetime, date
 import calendar
 from sqlalchemy.orm import joinedload
-from sqlalchemy import or_
+from sqlalchemy import or_, and_
 
 # Import ALL models
 from app.models.department import Department
@@ -1873,3 +1873,59 @@ def get_product_transactions(id):
             "pages": paginated.pages
         }
     }), 200
+    
+
+@core.route('/stock/recalibrate', methods=['POST'])
+@jwt_required
+def recalibrate_stock():
+    active_dept = get_active_department()
+    
+    # Base query for active products
+    query = Product.query.filter_by(is_active=True)
+    if active_dept:
+        query = query.filter_by(department_id=active_dept)
+        
+    products = query.all()
+    mismatch_count = 0
+    
+    for product in products:
+        # 1. Sum all additions: "in" OR "return" from a contractor (supplier_id is None)
+        additions = db.session.query(func.coalesce(func.sum(Transaction.quantity), 0)).filter(
+            Transaction.product_id == product.id,
+            Transaction.is_active == True,
+            or_(
+                Transaction.type == 'in',
+                and_(Transaction.type == 'return', Transaction.supplier_id == None)
+            )
+        ).scalar()
+
+        # 2. Sum all deductions: "out" OR "return" to a supplier (supplier_id is NOT None)
+        deductions = db.session.query(func.coalesce(func.sum(Transaction.quantity), 0)).filter(
+            Transaction.product_id == product.id,
+            Transaction.is_active == True,
+            or_(
+                Transaction.type == 'out',
+                and_(Transaction.type == 'return', Transaction.supplier_id != None)
+            )
+        ).scalar()
+
+        # 3. Compare and update
+        expected_stock = additions - deductions
+        
+        if product.current_stock != expected_stock:
+            product.current_stock = expected_stock
+            mismatch_count += 1
+            
+            # Optional: Log the recalibration activity
+            log = ActivityLog(
+                user_id=g.current_user.id,
+                action=f"Recalibrated Product #{product.id}): Stock forced to {expected_stock}"
+            )
+            db.session.add(log)
+            
+    try:
+        db.session.commit()
+        return jsonify({"message": f"System recalibrated. {mismatch_count} product(s) fixed."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500    
