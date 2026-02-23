@@ -613,7 +613,7 @@ def update_product(id):
 def get_pending_users():
     active_dept = get_active_department()
     
-    query = User.query.filter(User.is_active == False, User.role != 'ADMIN', User.department_id != None)
+    query = User.query.filter(User.approval_status != 'APPROVED', User.role != 'ADMIN')
     
     if active_dept:
         query = query.filter(User.department_id == active_dept)
@@ -622,24 +622,23 @@ def get_pending_users():
     
     results = []
     for user in pending_users:
-       
-        if not user.department_id:
-            return jsonify({
-                "error": f"Data Integrity Error: Pending worker {user.first_name} ({user.phoneno}) has no department assigned."
-            }), 400
-            
-
-        dept = Department.query.get(user.department_id)
-        if not dept:
-            return jsonify({
-                "error": f"Data Integrity Error: Department ID {user.department_id} for worker {user.first_name} does not exist."
-            }), 400
-            
-        user_dict = user.to_dict(is_admin=True) 
-        user_dict['department_name'] = dept.name
+        user_dict = user.to_dict(is_admin=True)
+        user_dict['approval_status'] = user.approval_status
+        user_dict['requested_department_id'] = user.requested_department_id
+        
+        # For current department
+        if user.department_id:
+            dept = Department.query.get(user.department_id)
+            user_dict['department_name'] = dept.name if dept else "Unknown"
+        
+        # For requested department (dept change case)
+        if user.requested_department_id:
+            req_dept = Department.query.get(user.requested_department_id)
+            user_dict['requested_department_name'] = req_dept.name if req_dept else "Unknown"
+        
         results.append(user_dict)
         
-    return jsonify(results), 200    
+    return jsonify(results), 200   
     
 @core.route('/approve-user', methods=['POST'])
 @jwt_required
@@ -654,7 +653,6 @@ def approve_user():
     if not target_user_id or phone is None or is_approved is None:
         return jsonify({"error": "Missing required fields (id, phone, approved)"}), 400
 
-    # Fetch the pending user using both ID and phone for security
     target_user = User.query.filter_by(id=target_user_id, phoneno=phone).first()
 
     if not target_user:
@@ -662,19 +660,48 @@ def approve_user():
 
     try:
         if is_approved:
-            # Activate the user so they can log in
-            target_user.is_active = True
-            db.session.commit()
-            return jsonify({"message": f"User {target_user.first_name} has been approved."}), 200
+            # CASE 1: New Signup Approval
+            if target_user.approval_status == 'PENDING_SIGNUP':
+                target_user.is_active = True
+                target_user.approval_status = 'APPROVED'
+                db.session.commit()
+                return jsonify({"message": f"User {target_user.first_name} has been approved and can now log in."}), 200
+            
+            # CASE 2: Department Change Approval
+            elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
+                if not target_user.requested_department_id:
+                    return jsonify({"error": "No department change request found"}), 400
+                
+                target_user.department_id = target_user.requested_department_id
+                target_user.requested_department_id = None
+                target_user.approval_status = 'APPROVED'
+                db.session.commit()
+                return jsonify({"message": f"Department change for {target_user.first_name} has been approved."}), 200
+            
+            else:
+                return jsonify({"error": "User is already approved"}), 400
+        
         else:
-            # Reject and delete the user so they can try registering again if needed
-            db.session.delete(target_user)
-            db.session.commit()
-            return jsonify({"message": "User registration rejected and removed."}), 200
+            # REJECT
+            # CASE 1: Reject new signup - delete the user
+            if target_user.approval_status == 'PENDING_SIGNUP':
+                db.session.delete(target_user)
+                db.session.commit()
+                return jsonify({"message": "User registration rejected and removed."}), 200
+            
+            # CASE 2: Reject department change - revert to old status
+            elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
+                target_user.requested_department_id = None
+                target_user.approval_status = 'APPROVED'
+                db.session.commit()
+                return jsonify({"message": f"Department change for {target_user.first_name} has been rejected."}), 200
+            
+            else:
+                return jsonify({"error": "Cannot reject already approved user"}), 400
             
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Database operation failed", "details": str(e)}), 500   
+        return jsonify({"error": "Database operation failed", "details": str(e)}), 500  
  
 @core.route('/users', methods=['GET'])
 @jwt_required
@@ -1156,6 +1183,8 @@ def get_all_employees():
             "department": dept_name.name,
             "department_id": w.department_id,
             "is_active": w.is_active,
+            "approval_status": w.approval_status,
+            "requested_department_id": w.requested_department_id,
             "joined_at": w.created_at
         })
     return jsonify(results), 200
@@ -1195,7 +1224,8 @@ def add_employee():
             phoneno=data['phone'],
             role=data.get('role', 'WORKER'),
             department_id=data.get('department_id'),
-            is_active=True # Admin created them, so they are active by default
+            is_active=True,
+            approval_status='APPROVED'  # Admin created = auto-approved
         )
         
         db.session.add(new_user)

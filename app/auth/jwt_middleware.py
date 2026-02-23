@@ -33,11 +33,11 @@ def jwt_required(fn):
 
         user = User.query.get(user_id)
 
-        if not user.is_active:
-                return jsonify({"message": "Account is inactive. Please contact Admin."}), 403
-
         if not user:
             return jsonify({"message": "User not found"}), 401
+        
+        if not user.is_active:
+            return jsonify({"message": "Account is inactive. Please contact Admin."}), 403
 
         # Attach user info to request context
         g.current_user = user
@@ -45,5 +45,3 @@ def jwt_required(fn):
         g.department_id = user.department_id
 
         return fn(*args, **kwargs)
-
-    return wrapper
