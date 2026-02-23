@@ -72,9 +72,11 @@ def log_attendance():
         existing_log.daily_overtime_earnings = daily_overtime_earnings
         existing_log.total_daily_earnings = total_daily_earnings
         existing_log.created_by = admin.id
+        existing_log.department_id = worker.department_id
     else:
         new_log = Attendance(
             user_id=worker.id,
+            department_id=worker.department_id,
             date=log_date,
             status=status,
             hours_worked=hours_worked,
