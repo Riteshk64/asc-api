@@ -1641,26 +1641,36 @@ def delete_contractor(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
     
-
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
 def get_contractor_stock(id):
-    results = db.session.query(
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    query = db.session.query(
         Product.id,
         Product.name,
         Product.product_code,
         Product.unit,
         func.sum(case(
             (Transaction.type == 'out', Transaction.quantity), 
-            (Transaction.type == 'return', -Transaction.quantity), # Subtract returns
+            (Transaction.type == 'return', -Transaction.quantity),
             else_=0
         )).label('net_qty')
     ).join(Transaction)\
      .filter(
          Transaction.contractor_id == id, 
-         Transaction.is_active == True  # ✅ CRITICAL FIX: Ignore deleted transactions
-     )\
-     .group_by(Product.id, Product.name, Product.product_code, Product.unit)\
+         Transaction.is_active == True
+     )
+
+    # ✅ Apply date filters if provided
+    if start_date and end_date:
+        query = query.filter(
+            func.date(Transaction.date) >= start_date, 
+            func.date(Transaction.date) <= end_date
+        )
+
+    results = query.group_by(Product.id, Product.name, Product.product_code, Product.unit)\
      .having(func.sum(case(
             (Transaction.type == 'out', Transaction.quantity),
             (Transaction.type == 'return', -Transaction.quantity),
