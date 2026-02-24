@@ -45,3 +45,5 @@ def jwt_required(fn):
         g.department_id = user.department_id
 
         return fn(*args, **kwargs)
+    
+    return wrapper

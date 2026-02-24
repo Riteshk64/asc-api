@@ -1834,7 +1834,7 @@ def get_product_transactions(id):
     # OPTIMIZED: Add pagination
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
-    per_page = min(per_page, 10000)  # Cap at 100
+    # per_page = min(per_page, 1000000)  
 
     # 2. Get Date Filters from Query Params
     start_str = request.args.get('start_date')
