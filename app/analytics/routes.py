@@ -1,5 +1,5 @@
 from flask import request, jsonify, g
-from sqlalchemy import func
+from sqlalchemy import func, case
 from app.auth.jwt_middleware import jwt_required
 from app.common.decorators import admin_only
 from app.models.product import Product
@@ -13,10 +13,13 @@ from . import analytics_bp
 
 # Helper to build filters based on request
 def build_filters():
-    # Handle Admin context switching or User default
     if g.role == 'ADMIN':
         header_dept = request.headers.get("X-Department-Id")
-        active_dept = int(header_dept) if header_dept else g.department_id
+        # ✅ Safety check: ensure it's a digit and not "undefined" or "null"
+        if header_dept and header_dept.isdigit():
+            active_dept = int(header_dept)
+        else:
+            active_dept = g.department_id
     else:
         active_dept = g.department_id
 
@@ -65,12 +68,17 @@ def get_dashboard_metrics():
     
     # Stock aggregation - single query
     stock_stats = db.session.query(
-        func.sum(Product.current_stock).label('total_stock'),
-        func.count(func.case([(Product.current_stock <= Product.min_stock, 1)], else_=0)).label('low_stock_count')
-    ).filter(
-        Product.is_active == True,
-        Product.department_id == active_dept if active_dept else True
-    ).first()
+    func.sum(Product.current_stock).label('total_stock'),
+    func.sum(
+        case(
+            (Product.current_stock <= Product.min_stock, 1), 
+            else_=0
+        )
+    ).label('low_stock_count')
+).filter(
+    Product.is_active == True,
+    Product.department_id == (active_dept if active_dept else Product.department_id)
+).first()
     
     response.update({
         "total_stock": float(stock_stats.total_stock or 0) if stock_stats else 0,
