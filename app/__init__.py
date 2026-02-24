@@ -21,7 +21,7 @@ def create_app():
     migrate.init_app(app, db)
 
 
-    CORS(app)
+    CORS(app, max_age=86400)  # Cache preflight response for 24 hours
 
 
     #import models
