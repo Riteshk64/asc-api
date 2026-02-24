@@ -642,16 +642,22 @@ def get_pending_users():
     
 @core.route('/approve-user', methods=['POST'])
 @jwt_required
-@admin_only
 def approve_user():
-    data = request.json
+    # 👇 Use get_json() safely
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
     target_user_id = data.get('id')
     phone = data.get('phone')
     is_approved = data.get('approved')
 
-    # Basic validation
-    if not target_user_id or phone is None or is_approved is None:
-        return jsonify({"error": "Missing required fields (id, phone, approved)"}), 400
+    # 👇 FIXED VALIDATION: Explicitly check for None
+    if target_user_id is None or phone is None or is_approved is None:
+        return jsonify({
+            "error": "Missing required fields (id, phone, approved)",
+            "received": data # 👈 This helps you debug if the frontend sent bad data
+        }), 400
 
     target_user = User.query.filter_by(id=target_user_id, phoneno=phone).first()
 
@@ -665,7 +671,7 @@ def approve_user():
                 target_user.is_active = True
                 target_user.approval_status = 'APPROVED'
                 db.session.commit()
-                return jsonify({"message": f"User {target_user.first_name} has been approved and can now log in."}), 200
+                return jsonify({"message": f"User {target_user.first_name} has been approved."}), 200
             
             # CASE 2: Department Change Approval
             elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
@@ -694,15 +700,16 @@ def approve_user():
                 target_user.requested_department_id = None
                 target_user.approval_status = 'APPROVED'
                 db.session.commit()
-                return jsonify({"message": f"Department change for {target_user.first_name} has been rejected."}), 200
+                return jsonify({"message": f"Department change rejected."}), 200
             
             else:
                 return jsonify({"error": "Cannot reject already approved user"}), 400
             
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Database operation failed", "details": str(e)}), 500  
- 
+        return jsonify({"error": "Database operation failed", "details": str(e)}), 500
+
+
 @core.route('/users', methods=['GET'])
 @jwt_required
 @admin_only
@@ -1222,7 +1229,7 @@ def add_employee():
             first_name=data['first_name'],
             last_name=data.get('last_name', ''),
             phoneno=data['phone'],
-            role=data.get('role', 'WORKER'),
+            role=data.get('role', 'USER'),
             department_id=data.get('department_id'),
             is_active=True,
             approval_status='APPROVED'  # Admin created = auto-approved

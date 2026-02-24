@@ -30,7 +30,12 @@ def get_department_name(dept_id, role):
 @auth.route("/my-details", methods=["GET"])
 @jwt_required
 def get_current_user():
-    user = g
+    # Safely get the user from the global context
+    user = getattr(g, 'current_user', None)
+
+    # ✅ IF USER WAS DELETED IN SUPABASE, RETURN 401 TO TRIGGER FRONTEND LOGOUT
+    if not user:
+        return jsonify({"message": "User not found or deleted"}), 401
 
     allowed_menus = [] 
 
@@ -45,27 +50,25 @@ def get_current_user():
         dept = Department.query.get(user.department_id)
         
         if dept and dept.permissions:
-
             allowed_menus = dept.permissions 
         else:
-           
             allowed_menus = ['products', 'settings']
             
         department_name = dept.name if dept else "Unknown"
 
+    # ✅ FIXED: Use 'user.first_name', NOT 'user.current_user.first_name'
     return jsonify({
-        "first_name": user.current_user.first_name,
-        "last_name": user.current_user.last_name,
-        "phone": user.current_user.phoneno,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "phone": user.phoneno,
         "role": user.role,               
         "department_id": user.department_id, 
         "department_name": department_name,
         "allowed_menus": allowed_menus,
-        "is_active": user.current_user.is_active,
-        "approval_status": user.current_user.approval_status,
-        "requested_department_id": user.current_user.requested_department_id
+        "is_active": user.is_active,
+        "approval_status": user.approval_status,
+        "requested_department_id": user.requested_department_id
     }), 200
-
 @auth.route("/verify-phone", methods=["POST"])
 def verify_phone():
     data = request.get_json()
@@ -80,107 +83,74 @@ def verify_phone():
     except Exception as e:
         return jsonify({"success": False, "message": "Invalid Firebase Token"}), 401
 
-    # Check if user exists
     user = User.query.filter_by(phoneno=phone).first()
 
-    if user:
-        token = generate_jwt(
-            {
-                "user_id": user.id,
-                "role": user.role,
-                "department_id": user.department_id,
-                "profile_complete": True
-            },
-            expires_in_minutes=60 * 24 * 7
+    # ✅ 1. CREATE ROW IMMEDIATELY IF IT DOESN'T EXIST
+    if not user:
+        user = User(
+            phoneno=phone,
+            is_active=False,
+            role='USER',  
+            approval_status='PENDING_SIGNUP' # Starts here
         )
+        db.session.add(user)
+        db.session.commit()
 
-        return jsonify({
-            "token": token,
-            "profile_complete": True
-        }), 200
+    # ✅ 2. PROFILE IS COMPLETE ONLY IF THEY HAVE A NAME
+    is_profile_done = bool(user.first_name and user.department_id)
 
-    temp_token = generate_jwt(
+    # ✅ 3. ISSUE A REAL TOKEN WITH A USER ID
+    token = generate_jwt(
         {
-            "phone": phone,
-            "profile_complete": False
+            "user_id": user.id,
+            "role": user.role,
+            "department_id": user.department_id,
         },
-        expires_in_minutes=15
+        expires_in_minutes=60 * 24 * 7 
     )
 
     return jsonify({
-        "token": temp_token,
-        "profile_complete": False
+        "token": token,
+        "profile_complete": is_profile_done,
+        "is_active": user.is_active,
+        "role": user.role
     }), 200
 
 @auth.route("/create-profile", methods=["POST"])
+@jwt_required 
 def create_profile():
-    # 1. Verify Token
-    auth_header = request.headers.get("Authorization")
-    if not auth_header:
-        return jsonify({"message": "Missing token"}), 401
-        
-    try:
-        token = auth_header.split(" ")[1]
-        decoded = jwt.decode(
-            token,
-            current_app.config["SECRET_KEY"],
-            algorithms=['HS256'],
-        )
-        phone = decoded.get("phone")
-    except Exception:
-        return jsonify({"message": "Invalid or expired token"}), 401
-
-    # 2. Get Input
     data = request.get_json()
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
-    dept_input = data.get("department_id")
+    
+    user = getattr(g, 'current_user', None)
+    if not user:
+        return jsonify({"message": "User not found"}), 404
 
-    # Use the environment variable to identify the Admin
-    admin_phone_env = os.environ.get("ADMIN_PHONE", "")
+    user.first_name = data.get("first_name")
+    user.last_name = data.get("last_name")
+    user.department_id = data.get("department_id")
+    
+    # ✅ SET THEM TO PENDING, DO NOT ACTIVATE THEM!
+    user.approval_status = 'PENDING_SIGNUP' 
+    user.is_active = False
+    
+    db.session.commit()
 
-    if admin_phone_env and phone == admin_phone_env:
-        final_role = "ADMIN"
-        final_dept_id = None 
-        is_active = True
-        approval_status = "APPROVED"
-    else:
-        final_role = "USER"
-        final_dept_id = dept_input
-        is_active = False
-        approval_status = "PENDING_SIGNUP"
-        
-        # Regular users MUST have a department
-        if not final_dept_id:
-            return jsonify({"message": "Department selection is mandatory"}), 400
-
-    user = User(
-        first_name=first_name,
-        last_name=last_name,
-        phoneno=phone,
-        role=final_role,
-        department_id=final_dept_id,
-        is_active=is_active,
-        approval_status=approval_status
-    )
-
-    try:
-        db.session.add(user)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"message": "Error creating profile", "error": str(e)}), 500
-
-    token = generate_jwt(
-        {"user_id": user.id, "role": user.role, "profile_complete": True},
+    new_token = generate_jwt(
+        {
+            "user_id": user.id,
+            "role": user.role,
+            "department_id": user.department_id,
+        },
         expires_in_minutes=60 * 24 * 7
     )
 
     return jsonify({
-        "token": token, 
-        "role": final_role, 
-        "is_active": is_active # 👈 Frontend uses this for the guard
-    })
+        "token": new_token,
+        "profile_complete": True,  # Frontend sees: Profile done
+        "is_active": False,        # Frontend sees: Not approved yet
+        "role": user.role
+    }), 200
+
 
 @auth.route("/profile/update", methods=["PUT"])
 @jwt_required

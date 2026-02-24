@@ -82,10 +82,10 @@ class User(db.Model):
     __tablename__ = 'users'
     
     id = db.Column(db.Integer, primary_key=True)
-    first_name = db.Column(db.String(100), nullable=False)
-    last_name = db.Column(db.String(100), nullable=False)
+    first_name = db.Column(db.String(100), nullable=True)
+    last_name = db.Column(db.String(100), nullable=True)
     phoneno = db.Column(db.String(20), unique=True, nullable=False)
-    role = db.Column(db.String(20), nullable=False, default='WORKER') # 'ADMIN' or 'WORKER'
+    role = db.Column(db.String(20), nullable=False, default='USER') 
 
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
     approval_status = db.Column(db.String(20), default='APPROVED')  # 'APPROVED', 'PENDING_SIGNUP', 'PENDING_DEPT_CHANGE'
