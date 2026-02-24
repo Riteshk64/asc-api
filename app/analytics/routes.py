@@ -66,7 +66,7 @@ def get_dashboard_metrics():
     # Stock aggregation - single query
     stock_stats = db.session.query(
         func.sum(Product.current_stock).label('total_stock'),
-        func.count(func.case((Product.current_stock <= Product.min_stock, 1))).label('low_stock_count')
+        func.count(func.case([(Product.current_stock <= Product.min_stock, 1)], else_=0)).label('low_stock_count')
     ).filter(
         Product.is_active == True,
         Product.department_id == active_dept if active_dept else True
