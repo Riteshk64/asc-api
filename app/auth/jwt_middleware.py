@@ -70,18 +70,22 @@ def jwt_required(fn):
 
             user_id = payload.get('user_id')
             
-            # 2. Block old tokens that don't have a user_id
-            if not user_id:
-                return jsonify({"message": "Legacy token detected. Please log out and back in."}), 401
-                
-            # 3. Attach basic info to global context FIRST
-            g.user_id = user_id
-            g.role = payload.get('role')
-            g.department_id = payload.get('department_id')
+            # ... fetch the database user
+            user = User.query.get(user_id)
 
-            # 4. Fetch the database user NEXT
-            user = User.query.get(g.user_id)
+            if not user:
+                return jsonify({"message": "User not found or deleted"}), 401
 
+            g.current_user = user
+            
+            # ✅ FIX: Use the DATABASE values, not the TOKEN values
+            # This ensures that if an admin changes a user's dept, 
+            # the user doesn't have to log out/in to see the change.
+            g.user_id = user.id
+            g.role = user.role
+            g.department_id = user.department_id
+
+            
             # ✅ CRITICAL FIX: If user was deleted in Supabase, return 401 immediately!
             # This triggers the frontend to log them out and go to Sign In.
             if not user:

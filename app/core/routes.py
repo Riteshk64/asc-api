@@ -22,14 +22,16 @@ core = Blueprint('core', __name__, url_prefix='/core')
 
 
 def get_active_department():
-    
+    # Admins can "impersonate" departments via headers
     if g.role == "ADMIN":
         try:
             dept_id = request.headers.get("X-Department-Id")
             return int(dept_id) if dept_id else None
         except ValueError:
             return None
-    return g.department_id
+            
+    # ✅ Workers always use their latest database-assigned department
+    return g.current_user.department_id
 # @core.route('/stock/operate', methods=['POST'])
 # @jwt_required
 # def stock_operation():
@@ -643,7 +645,6 @@ def get_pending_users():
 @core.route('/approve-user', methods=['POST'])
 @jwt_required
 def approve_user():
-    # 👇 Use get_json() safely
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
@@ -681,6 +682,7 @@ def approve_user():
                 target_user.department_id = target_user.requested_department_id
                 target_user.requested_department_id = None
                 target_user.approval_status = 'APPROVED'
+                target_user.is_active = True
                 db.session.commit()
                 return jsonify({"message": f"Department change for {target_user.first_name} has been approved."}), 200
             
@@ -688,8 +690,7 @@ def approve_user():
                 return jsonify({"error": "User is already approved"}), 400
         
         else:
-            # REJECT
-            # CASE 1: Reject new signup - delete the user
+ 
             if target_user.approval_status == 'PENDING_SIGNUP':
                 db.session.delete(target_user)
                 db.session.commit()
@@ -699,8 +700,12 @@ def approve_user():
             elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
                 target_user.requested_department_id = None
                 target_user.approval_status = 'APPROVED'
+                
+                # ✅ ADD THIS: Unlock the user so they can use their OLD department
+                target_user.is_active = True 
+                
                 db.session.commit()
-                return jsonify({"message": f"Department change rejected."}), 200
+                return jsonify({"message": "Department change rejected. User reverted to original department."}), 200
             
             else:
                 return jsonify({"error": "Cannot reject already approved user"}), 400

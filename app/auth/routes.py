@@ -167,32 +167,26 @@ def update_profile():
     if 'last_name' in data:
         user.last_name = data['last_name']
 
-    # 2. Handle Department Change (Only for Non-Admins)
-    # If a regular worker changes their department, we lock the account (is_active=False)
-    # so an Admin must approve the transfer.
     if user.role != 'ADMIN' and 'department_id' in data:
-        try:
-            new_dept_id = int(data['department_id'])
+        new_dept_id = int(data['department_id'])
+        if user.department_id != new_dept_id:
+            dept = Department.query.get(new_dept_id)
+            if not dept:
+                return jsonify({"error": "Invalid Department ID"}), 400
+
+            user.requested_department_id = new_dept_id
+            user.approval_status = "PENDING_DEPT_CHANGE"
+
+            user.is_active = False 
             
-            # Only act if the department is ACTUALLY changing
-            if user.department_id != new_dept_id:
-                # Verify the new department exists
-                dept = Department.query.get(new_dept_id)
-                if not dept:
-                    return jsonify({"error": "Invalid Department ID"}), 400
+            db.session.commit()
+            return jsonify({
+                "message": "Department change requested. Account locked.",
+                "approval_status": "PENDING_DEPT_CHANGE",
+                "is_active": False
+            }), 200
 
-                user.requested_department_id = new_dept_id
-                user.approval_status = "PENDING_DEPT_CHANGE"
-                # Keep is_active = True (user can still use app)
-                
-                db.session.commit()
-                return jsonify({
-                    "message": "Department change requested. Waiting for admin approval.",
-                    "approval_status": "PENDING_DEPT_CHANGE"
-                }), 200
-
-        except (ValueError, TypeError):
-            return jsonify({"error": "Invalid Department Format"}), 400
+        
 
     # 3. Save standard changes (if account wasn't locked above)
     try:
@@ -203,7 +197,7 @@ def update_profile():
             "first_name": user.first_name,
             "last_name": user.last_name
         }), 200
-
+ 
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
