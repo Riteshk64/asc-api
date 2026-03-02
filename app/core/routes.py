@@ -17,6 +17,8 @@ from app.models.transaction import Transaction
 from app.models.user import User  
 from app.models.activity_log import ActivityLog
 from app.models.attendance import Attendance
+from app.models.category import Category
+from app.models.subcategory import SubCategory
 
 core = Blueprint('core', __name__, url_prefix='/core')
 
@@ -32,140 +34,7 @@ def get_active_department():
             
     # ✅ Workers always use their latest database-assigned department
     return g.current_user.department_id
-# @core.route('/stock/operate', methods=['POST'])
-# @jwt_required
-# def stock_operation():
-#     data = request.get_json()
-#     sku = data.get('sku')
-#     op_type = data.get('type')  # 'in', 'out', 'return', 'return_defective'
-    
-#     try:
-#         qty = float(data.get('qty', 0))
-#         if qty <= 0: raise ValueError
-#     except ValueError:
-#         return jsonify({"error": "Invalid positive quantity required"}), 400
 
-#     if not sku or not op_type:
-#         return jsonify({"error": "SKU and operation type are required"}), 400
-
-#     active_dept = get_active_department()
-#     if not active_dept:
-#         return jsonify({"error": "Department context missing"}), 400
-
-#     product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
-
-#     if not product:
-#         if op_type != 'in':
-#             return jsonify({"error": "Product not found"}), 404
-
-#         product_name = data.get('productName')
-#         if not product_name:
-#             return jsonify({"error": "Product Name is required for new products"}), 400
-
-#         product = Product(
-#             name=product_name, product_code=sku, unit=data.get('unit', 'pcs'),
-#             category=data.get('category', 'General'), current_stock=0.0,
-#             department_id=active_dept, is_active=True
-#         )
-#         db.session.add(product)
-#         db.session.flush()
-
-#     if product.department_id != active_dept:
-#         return jsonify({"error": "You cannot operate on another department's stock"}), 403
-
-#     supplier_id = None
-#     contractor_id = None
-#     default_name = "Manual Adjustment"
-
-#     # --- STOCK IN (Supplier -> Inventory) ---
-#     if op_type == 'in':
-#         product.current_stock += qty
-#         sup_name = (data.get('supplier_name') or default_name).strip()
-#         supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-#         if not supplier:
-#             supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
-#             db.session.add(supplier)
-#             db.session.flush()
-#         supplier_id = supplier.id
-
-#     # --- RETURN DEFECTIVE (Inventory -> Supplier) ---
-#     elif op_type == 'return_defective':
-#         if product.current_stock < qty:
-#             return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
-        
-#         product.current_stock -= qty
-#         sup_name = (data.get('supplier_name') or default_name).strip()
-#         supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-#         if not supplier:
-#             supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
-#             db.session.add(supplier)
-#             db.session.flush()
-#         supplier_id = supplier.id
-
-#     # --- STOCK OUT (Inventory -> Contractor) ---
-#     elif op_type == 'out':
-#         if product.current_stock < qty:
-#             return jsonify({"error": f"Insufficient stock. Current: {product.current_stock}"}), 400
-#         product.current_stock -= qty
-#         cont_name = (data.get('contractor_name') or default_name).strip()
-#         contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-#         if not contractor:
-#             contractor = Contractor(name=cont_name, is_active=True)
-#             db.session.add(contractor)
-#             db.session.flush()
-#         contractor_id = contractor.id
-
-#     # --- RETURN FROM CONTRACTOR (Contractor -> Inventory) ---
-#     elif op_type == 'return':
-        
-#         # Scenario A: Returning defective stock TO a Supplier
-#         if data.get('supplier_name'):
-#             if product.current_stock < qty:
-#                 return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
-            
-#             product.current_stock -= qty  # Stock goes DOWN
-#             sup_name = data.get('supplier_name').strip()
-            
-#             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-#             if not supplier:
-#                 supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
-#                 db.session.add(supplier)
-#                 db.session.flush()
-#             supplier_id = supplier.id
-
-#         # Scenario B: Receiving unused stock FROM a Contractor
-#         else:
-#             product.current_stock += qty  # Stock goes UP
-#             cont_name = (data.get('contractor_name') or default_name).strip()
-            
-#             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-#             if not contractor:
-#                 contractor = Contractor(name=cont_name, is_active=True)
-#                 db.session.add(contractor)
-#                 db.session.flush()
-#             contractor_id = contractor.id
-
-#     txn = Transaction(
-#         product_id=product.id, type=op_type, quantity=qty,
-#         supplier_id=supplier_id, contractor_id=contractor_id,
-#         department_id=active_dept, created_by=g.current_user.id, is_active=True 
-#     )
-
-#     try:
-#         db.session.add(txn)
-#         log = ActivityLog(
-#             user_id=g.current_user.id,
-#             action=f"Stock {op_type.upper()}: {qty} {product.unit} - {product.name}",
-#             transaction_id=txn.id
-#         )
-#         db.session.add(log)
-#         db.session.add(product) 
-#         db.session.commit()
-#         return jsonify({"message": "Stock updated successfully", "new_qty": product.current_stock}), 200
-#     except Exception as e:
-#         db.session.rollback()
-#         return jsonify({"error": str(e)}), 500
-    
 
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
@@ -224,7 +93,7 @@ def stock_operation():
             name=product_name,
             product_code=sku,
             unit=data.get('unit', 'pcs'),
-            category=data.get('category', 'General'),
+            # category=data.get('category', 'General'),
             current_stock=0.0,
             department_id=active_dept,
             is_active=True
@@ -1575,28 +1444,82 @@ def add_contractor():
         return jsonify({"error": str(e)}), 500
     
 
+@core.route('/categories', methods=['GET'])
+@jwt_required
+def get_categories():
+    cats = Category.query.order_by(Category.display_order.asc()).all()
+    return jsonify([{"id": c.id, "name": c.name} for c in cats]), 200
+
+@core.route('/categories/reorder', methods=['PUT'])
+@jwt_required
+def reorder_categories():
+    data = request.get_json() 
+    for item in data:
+        cat = Category.query.get(item['id'])
+        if cat: cat.display_order = item['display_order']
+    db.session.commit()
+    return jsonify({"message": "Category order updated"}), 200
+
+@core.route('/sub-categories/reorder', methods=['PUT'])
+@jwt_required
+def reorder_sub_categories():
+    data = request.get_json()
+    for item in data:
+        sub = SubCategory.query.get(item['id'])
+        if sub: sub.display_order = item['display_order']
+    db.session.commit()
+    return jsonify({"message": "Sub-Category order updated"}), 200
+
+
+@core.route('/sub-categories', methods=['GET'])
+@jwt_required
+def get_sub_categories():
+    # Notice the order_by change here
+    subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
+    return jsonify([{"id": s.id, "name": s.name} for s in subs]), 200
+
+# --- UPDATED ADD PRODUCT ---
 
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
     data = request.get_json()
-    sku = data.get('sku')
+    sku = data.get('sku', '').upper()
     
-    active_dept = get_active_department()
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
+    # 🧠 AUTO-FILL CATEGORY IF BLANK
+    cat_id = data.get('category_id')
+    if not cat_id:
+        target = "OTHER"
+        if sku.startswith('BK'): target = "BLACK"
+        elif sku.startswith('GR'): target = "GREY"
+        elif sku.startswith('A'): target = "WHITE"
+        
+        found = Category.query.filter_by(name=target).first()
+        if found: cat_id = found.id
+
+    # 🧠 AUTO-CREATE SUB-CATEGORY IF NEW
+    sub_cat_id = data.get('sub_category_id')
+    sub_name = data.get('sub_category_name', '').strip().upper()
+    if not sub_cat_id and sub_name:
+        sub = SubCategory.query.filter_by(name=sub_name).first()
+        if not sub:
+            sub = SubCategory(name=sub_name)
+            db.session.add(sub)
+            db.session.flush() # Gets the ID without committing yet
+        sub_cat_id = sub.id
 
     new_p = Product(
         name=data['name'],
         product_code=sku,
-        category=data.get('category'),
+        category_id=cat_id,
+        sub_category_id=sub_cat_id,
+        department_id=get_active_department(),
         current_stock=0,
-        department_id=active_dept,
         is_active=True
     )
     db.session.add(new_p)
     db.session.commit()
-    return jsonify({"message": "Product created"}), 201
+    return jsonify({"message": "Product created", "id": new_p.id}), 201
 
 
 @core.route('/products/<int:id>', methods=['DELETE'])
