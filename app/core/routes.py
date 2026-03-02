@@ -1480,6 +1480,71 @@ def get_sub_categories():
 
 # --- UPDATED ADD PRODUCT ---
 
+@core.route('/categories', methods=['POST'])
+@jwt_required
+def add_category():
+    data = request.get_json()
+    if not data or 'name' not in data or 'display_order':
+        return jsonify({"error": "Category name is required"}), 400
+        
+    new_cat = Category(
+        name=data['name'], 
+        display_order=data.get('display_order', 0),
+        match_codes=data.get('match_codes', '') # 👈 Add this
+    )
+    db.session.add(new_cat)
+    db.session.commit()
+    return jsonify({"message": "Category added successfully", "id": new_cat.id}), 201
+
+@core.route('/categories/<int:cat_id>', methods=['DELETE'])
+@jwt_required
+def delete_category(cat_id):
+    cat = Category.query.get(cat_id)
+    if not cat:
+        return jsonify({"error": "Category not found"}), 404
+        
+    # Optional: Check if products depend on this category before deleting
+    # if Product.query.filter_by(category_id=cat_id).first():
+    #     return jsonify({"error": "Cannot delete category with associated products"}), 400
+    
+
+    db.session.delete(cat)
+    db.session.commit()
+    return jsonify({"message": "Category deleted successfully"}), 200
+
+
+@core.route('/sub-categories', methods=['POST'])
+@jwt_required
+def add_sub_category():
+    data = request.get_json()
+    if not data or 'name' not in data:
+        return jsonify({"error": "Sub-Category name is required"}), 400
+        
+    new_sub = SubCategory(
+        name=data['name'], 
+        display_order=data.get('display_order', 0),
+        match_rule=data.get('match_rule', 'first_word')
+    )
+    db.session.add(new_sub)
+    db.session.commit()
+    return jsonify({"message": "Sub-Category added successfully", "id": new_sub.id}), 201
+
+@core.route('/sub-categories/<int:sub_id>', methods=['DELETE'])
+@jwt_required
+def delete_sub_category(sub_id):
+    sub = SubCategory.query.get(sub_id)
+    if not sub:
+        return jsonify({"error": "Sub-Category not found"}), 404
+        
+    # Prevent deletion if products are currently using this sub-category
+    # if Product.query.filter_by(sub_category_id=sub_id).first():
+    #     return jsonify({"error": "Cannot delete sub-category with associated products"}), 400
+
+    db.session.delete(sub)
+    db.session.commit()
+    return jsonify({"message": "Sub-Category deleted successfully"}), 200
+
+
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
