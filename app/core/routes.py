@@ -367,6 +367,23 @@ def get_user_attendance_history(id):
 # ==========================================
 # 2. LISTS (Products & Transactions)
 # ==========================================
+# @core.route('/products', methods=['GET'])
+# @jwt_required
+# def get_products():
+#     active_dept = get_active_department()
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+
+#     products = Product.query.filter_by(
+#         is_active=True,
+#         department_id=active_dept
+#     ).all()
+
+#     return jsonify([p.to_dict() for p in products]), 200
+
+# In your Flask routes file
+from flask import request, jsonify
+from sqlalchemy import or_
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -374,14 +391,43 @@ def get_products():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    products = Product.query.filter_by(
-        is_active=True,
-        department_id=active_dept
-    ).all()
+    # 1. Get Pagination & Filter Params
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    search = request.args.get('search', '', type=str)
 
-    return jsonify([p.to_dict() for p in products]), 200
+    query = Product.query.filter_by(is_active=True, department_id=active_dept)
 
+    # 2. Apply Search Filter
+    if search:
+        query = query.filter(
+            or_(
+                Product.name.ilike(f'%{search}%'),
+                Product.product_code.ilike(f'%{search}%')
+            )
+        )
 
+    # 3. Apply Category/Sub-Category Filters
+    cat_ids = request.args.getlist('cat_ids[]', type=int)
+    if cat_ids:
+        query = query.filter(Product.category_id.in_(cat_ids))
+
+    sub_ids = request.args.getlist('sub_ids[]', type=int)
+    if sub_ids:
+        query = query.filter(Product.sub_category_id.in_(sub_ids))
+
+    # 4. Paginate
+    paginated = query.paginate(page=page, per_page=per_page, error_out=False)
+
+    return jsonify({
+        "data": [p.to_dict() for p in paginated.items],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": paginated.total,
+            "pages": paginated.pages
+        }
+    }), 200
 
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
@@ -469,6 +515,28 @@ def update_product(id):
                     product.max_stock = float(val)
             except ValueError: 
                 pass 
+
+        if 'category_name' in data:
+            cat_name = data['category_name'].strip().upper()
+            if cat_name:
+                category = Category.query.filter_by(name=cat_name).first()
+                if not category:
+                    category = Category(name=cat_name)
+                    db.session.add(category)
+                    db.session.flush() # Get ID
+                product.category_id = category.id
+
+        # 8. Update Sub-Category (Upsert Logic)
+        if 'sub_category_name' in data:
+            sub_name = data['sub_category_name'].strip().upper()
+            if sub_name:
+                sub_cat = SubCategory.query.filter_by(name=sub_name).first()
+                if not sub_cat:
+                    sub_cat = SubCategory(name=sub_name)
+                    db.session.add(sub_cat)
+                    db.session.flush() # Get ID
+                product.sub_category_id = sub_cat.id
+ 
 
         db.session.commit()
         return jsonify({"message": "Product updated"}), 200
@@ -1545,46 +1613,86 @@ def delete_sub_category(sub_id):
     return jsonify({"message": "Sub-Category deleted successfully"}), 200
 
 
+# @core.route('/products', methods=['POST'])
+# @jwt_required
+# def add_product():
+#     data = request.get_json()
+#     sku = data.get('sku', '').upper()
+    
+#     # 🧠 AUTO-FILL CATEGORY IF BLANK
+#     cat_id = data.get('category_id')
+#     if not cat_id:
+#         target = "OTHER"
+#         if sku.startswith('BK'): target = "BLACK"
+#         elif sku.startswith('GR'): target = "GREY"
+#         elif sku.startswith('A'): target = "WHITE"
+        
+#         found = Category.query.filter_by(name=target).first()
+#         if found: cat_id = found.id
+
+#     # 🧠 AUTO-CREATE SUB-CATEGORY IF NEW
+#     sub_cat_id = data.get('sub_category_id')
+#     sub_name = data.get('sub_category_name', '').strip().upper()
+#     if not sub_cat_id and sub_name:
+#         sub = SubCategory.query.filter_by(name=sub_name).first()
+#         if not sub:
+#             sub = SubCategory(name=sub_name)
+#             db.session.add(sub)
+#             db.session.flush() # Gets the ID without committing yet
+#         sub_cat_id = sub.id
+
+#     new_p = Product(
+#         name=data['name'],
+#         product_code=sku,
+#         category_id=cat_id,
+#         sub_category_id=sub_cat_id,
+#         department_id=get_active_department(),
+#         current_stock=0,
+#         is_active=True
+#     )
+#     db.session.add(new_p)
+#     db.session.commit()
+#     return jsonify({"message": "Product created", "id": new_p.id}), 201
+
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
     data = request.get_json()
-    sku = data.get('sku', '').upper()
     
-    # 🧠 AUTO-FILL CATEGORY IF BLANK
-    cat_id = data.get('category_id')
-    if not cat_id:
-        target = "OTHER"
-        if sku.startswith('BK'): target = "BLACK"
-        elif sku.startswith('GR'): target = "GREY"
-        elif sku.startswith('A'): target = "WHITE"
-        
-        found = Category.query.filter_by(name=target).first()
-        if found: cat_id = found.id
+    # 1. Handle Category (Get existing or create new)
+    cat_name = data.get('category_name', 'OTHER').strip().upper()
+    category = Category.query.filter_by(name=cat_name).first()
+    if not category:
+        category = Category(name=cat_name)
+        db.session.add(category)
+        db.session.flush() # Get ID before product creation
 
-    # 🧠 AUTO-CREATE SUB-CATEGORY IF NEW
-    sub_cat_id = data.get('sub_category_id')
-    sub_name = data.get('sub_category_name', '').strip().upper()
-    if not sub_cat_id and sub_name:
-        sub = SubCategory.query.filter_by(name=sub_name).first()
-        if not sub:
-            sub = SubCategory(name=sub_name)
-            db.session.add(sub)
-            db.session.flush() # Gets the ID without committing yet
-        sub_cat_id = sub.id
+    # 2. Handle Sub-Category (Get existing or create new)
+    sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
+    sub_category = SubCategory.query.filter_by(name=sub_name).first()
+    if not sub_category:
+        sub_category = SubCategory(name=sub_name)
+        db.session.add(sub_category)
+        db.session.flush()
 
-    new_p = Product(
+    # 3. Create Product
+    new_product = Product(
         name=data['name'],
-        product_code=sku,
-        category_id=cat_id,
-        sub_category_id=sub_cat_id,
-        department_id=get_active_department(),
-        current_stock=0,
-        is_active=True
+        product_code=data['sku'],
+        category_id=category.id,
+        sub_category_id=sub_category.id,
+        current_stock=data.get('qty', 0),
+        min_stock=data.get('min_stock', 10),
+        max_stock=data.get('max_stock', 100),
+        unit=data.get('unit', 'pcs')
     )
-    db.session.add(new_p)
+    
+    db.session.add(new_product)
     db.session.commit()
-    return jsonify({"message": "Product created", "id": new_p.id}), 201
+    
+    # Clean up any previously orphaned categories (typos from previous edits)
+    
+    return jsonify({"message": "Product added successfully"}), 201
 
 
 @core.route('/products/<int:id>', methods=['DELETE'])
