@@ -1658,6 +1658,11 @@ def delete_sub_category(sub_id):
 @jwt_required
 def add_product():
     data = request.get_json()
+
+    active_dept = get_active_department()
+
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
     
     # 1. Handle Category (Get existing or create new)
     cat_name = data.get('category_name', 'OTHER').strip().upper()
@@ -1678,9 +1683,11 @@ def add_product():
     # 3. Create Product
     new_product = Product(
         name=data['name'],
-        product_code=data['sku'],
+        # ✅ FIX: Use .get() to check for 'product_code' first, then fallback to 'sku'
+        product_code=data.get('product_code', data.get('sku', '')), 
         category_id=category.id,
         sub_category_id=sub_category.id,
+        department_id=active_dept,
         current_stock=data.get('qty', 0),
         min_stock=data.get('min_stock', 10),
         max_stock=data.get('max_stock', 100),
