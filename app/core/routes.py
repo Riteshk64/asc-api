@@ -382,8 +382,6 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 
 # In your Flask routes file
-from flask import request, jsonify
-from sqlalchemy import or_
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -391,44 +389,12 @@ def get_products():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    # 1. Get Pagination & Filter Params
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 50, type=int)
-    search = request.args.get('search', '', type=str)
+    products = Product.query.filter_by(
+        is_active=True,
+        department_id=active_dept
+    ).all()
 
-    query = Product.query.filter_by(is_active=True, department_id=active_dept)
-
-    # 2. Apply Search Filter
-    if search:
-        query = query.filter(
-            or_(
-                Product.name.ilike(f'%{search}%'),
-                Product.product_code.ilike(f'%{search}%')
-            )
-        )
-
-    # 3. Apply Category/Sub-Category Filters
-    cat_ids = request.args.getlist('cat_ids[]', type=int)
-    if cat_ids:
-        query = query.filter(Product.category_id.in_(cat_ids))
-
-    sub_ids = request.args.getlist('sub_ids[]', type=int)
-    if sub_ids:
-        query = query.filter(Product.sub_category_id.in_(sub_ids))
-
-    # 4. Paginate
-    paginated = query.paginate(page=page, per_page=per_page, error_out=False)
-
-    return jsonify({
-        "data": [p.to_dict() for p in paginated.items],
-        "pagination": {
-            "page": page,
-            "per_page": per_page,
-            "total": paginated.total,
-            "pages": paginated.pages
-        }
-    }), 200
-
+    return jsonify([p.to_dict() for p in products]), 200
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
