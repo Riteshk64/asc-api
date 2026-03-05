@@ -380,8 +380,9 @@ def get_user_attendance_history(id):
 #     ).all()
 
 #     return jsonify([p.to_dict() for p in products]), 200
+from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload # 👈 Ensure this is imported at the top
 
-# In your Flask routes file
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -389,12 +390,56 @@ def get_products():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    products = Product.query.filter_by(
-        is_active=True,
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+
+    # IF FILTER IS ACTIVE:
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            
+            results = db.session.query(
+                Product,
+                func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
+                              (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
+                func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
+                              (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
+            ).options(
+                # 👇 THIS IS THE MAGIC THAT FIXES THE 9-SECOND DELAY
+                joinedload(Product.category_rel),
+                joinedload(Product.sub_category_rel)
+            ).outerjoin(Transaction, and_(
+                Transaction.product_id == Product.id, 
+                Transaction.is_active == True,
+                Transaction.created_at.between(start_date, end_date)
+            )).filter(
+                Product.department_id == active_dept, 
+                Product.is_active == True
+            ).group_by(Product.id).all()
+
+            data = []
+            for p, t_in, t_out in results:
+                p_dict = p.to_dict()
+                p_dict['total_stock_in'] = float(t_in or 0)
+                p_dict['total_stock_out'] = float(t_out or 0)
+                data.append(p_dict)
+            return jsonify(data), 200
+        except ValueError:
+            pass
+
+    # ALL TIME DATA (NO DATE FILTER):
+    # 👇 ADD JOINEDLOAD HERE AS WELL!
+    products = Product.query.options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
+    ).filter_by(
+        is_active=True, 
         department_id=active_dept
     ).all()
-
+    
     return jsonify([p.to_dict() for p in products]), 200
+
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
@@ -637,27 +682,29 @@ def get_users():
 
     # Pass is_admin=True so the frontend gets the payroll configuration data
     return jsonify([user.to_dict(is_admin=True) for user in users]), 200
-
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 @admin_only
 def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
-
     active_dept = get_active_department()
 
-    # Base Query with eager loading via joins
-    query = Transaction.query\
-        .join(Product)\
-        .outerjoin(Supplier)\
-        .outerjoin(Contractor)\
-        .filter(
-            Transaction.is_active == True,
-            Product.is_active == True,
-            or_(Supplier.id == None, Supplier.is_active == True),
-            or_(Contractor.id == None, Contractor.is_active == True)
-        )
+    # 👇 ADD .options() HERE
+    query = Transaction.query.options(
+        joinedload(Transaction.product),
+        joinedload(Transaction.supplier),
+        joinedload(Transaction.contractor)
+    ).join(Product)\
+     .outerjoin(Supplier)\
+     .outerjoin(Contractor)\
+     .filter(
+        Transaction.is_active == True,
+        Product.is_active == True,
+        or_(Supplier.id == None, Supplier.is_active == True),
+        or_(Contractor.id == None, Contractor.is_active == True)
+    )
+
     if active_dept:
         query = query.filter(Product.department_id == active_dept)
 
@@ -782,22 +829,31 @@ def update_transaction(id):
 @jwt_required
 @admin_only
 def get_recycle_bin():
-    active_dept = get_active_department() # <--- 1. Get the Context
+    active_dept = get_active_department()
 
     # --- Transactions ---
-    txn_query = Transaction.query\
-        .join(Product)\
-        .filter(Transaction.is_active == False, Product.is_active == True)
+    # 👇 ADD .options() HERE
+    txn_query = Transaction.query.options(
+        joinedload(Transaction.product),
+        joinedload(Transaction.supplier),
+        joinedload(Transaction.contractor)
+    ).join(Product).filter(Transaction.is_active == False, Product.is_active == True)
     
     if active_dept:
-        txn_query = txn_query.filter(Product.department_id == active_dept) # <--- Filter
-    
+        txn_query = txn_query.filter(Product.department_id == active_dept)
+        
     txns = txn_query.order_by(desc(Transaction.created_at)).all()
     
     # --- Products ---
-    prod_query = Product.query.filter_by(is_active=False)
+    # 👇 ADD .options() HERE
+    prod_query = Product.query.options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
+    ).filter_by(is_active=False)
+    
     if active_dept:
-        prod_query = prod_query.filter_by(department_id=active_dept) # <--- Filter
+        prod_query = prod_query.filter_by(department_id=active_dept)
+        
     products = prod_query.all()
 
     # --- Suppliers ---
@@ -1857,8 +1913,12 @@ def get_supplier_products(id):
 
         # --- MODE 1: Drill Down (Transaction History) ---
         if product_id:
-            # We now fetch both 'in' and 'return' so the history modal shows everything
-            transactions = Transaction.query.filter(
+            # 👇 ADD .options() HERE
+            transactions = Transaction.query.options(
+                joinedload(Transaction.product),
+                joinedload(Transaction.supplier),
+                joinedload(Transaction.contractor)
+            ).filter(
                 Transaction.supplier_id == id,
                 Transaction.product_id == product_id,
                 func.lower(Transaction.type).in_(['in', 'return'])
@@ -1922,12 +1982,15 @@ def get_product_transactions(id):
     end_str = request.args.get('end_date')
 
     # 3. Build Base Query (Identical to get_transactions, but filtered by ID)
-    query = Transaction.query\
-        .join(Product)\
-        .outerjoin(Supplier)\
-        .outerjoin(Contractor)\
-        .filter(
-            Transaction.product_id == id,  # 👈 Specific Product Filter
+    query = Transaction.query.options(
+        joinedload(Transaction.product),
+        joinedload(Transaction.supplier),
+        joinedload(Transaction.contractor)
+    ).join(Product)\
+     .outerjoin(Supplier)\
+     .outerjoin(Contractor)\
+     .filter(
+         Transaction.product_id == id, # 👈 Specific Product Filter
             Transaction.is_active == True,
             Product.is_active == True,
             or_(Supplier.id == None, Supplier.is_active == True),
