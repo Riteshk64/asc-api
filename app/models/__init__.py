@@ -6,3 +6,6 @@ from .product import Product
 from .transaction import Transaction
 from .activity_log import ActivityLog
 from .attendance import Attendance
+from .category import Category
+from .subcategory import SubCategory
+from .categorysuborder import CategorySubOrder

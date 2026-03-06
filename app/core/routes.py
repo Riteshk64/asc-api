@@ -19,6 +19,7 @@ from app.models.activity_log import ActivityLog
 from app.models.attendance import Attendance
 from app.models.category import Category
 from app.models.subcategory import SubCategory
+from app.models.categorysuborder import CategorySubOrder
 
 core = Blueprint('core', __name__, url_prefix='/core')
 
@@ -1533,48 +1534,109 @@ def add_contractor():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
     
-
 @core.route('/categories', methods=['GET'])
 @jwt_required
 def get_categories():
     cats = Category.query.order_by(Category.display_order.asc()).all()
-    return jsonify([{"id": c.id, "name": c.name} for c in cats]), 200
+    result = []
+    for c in cats:
+        # Fetch any custom sub-category orders for this specific category
+        sub_orders_query = CategorySubOrder.query.filter_by(category_id=c.id).all()
+        # Convert to a fast dictionary: {"sub_category_id": display_order}
+        sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
+        
+        result.append({
+            "id": c.id, 
+            "name": c.name, 
+            "display_order": c.display_order,
+            "sub_orders": sub_orders_dict # 👈 We inject the custom orders here!
+        })
+    return jsonify(result), 200
 
 @core.route('/categories/reorder', methods=['PUT'])
 @jwt_required
 def reorder_categories():
     data = request.get_json() 
-    for item in data:
-        cat = Category.query.get(item['id'])
-        if cat: cat.display_order = item['display_order']
+    # data is exactly what we need: [{'id': 1, 'display_order': 2}, ...]
+    
+    # This executes a single bulk UPDATE statement, completely bypassing the SELECT loop
+    db.session.bulk_update_mappings(Category, data)
     db.session.commit()
+    
     return jsonify({"message": "Category order updated"}), 200
 
 @core.route('/sub-categories/reorder', methods=['PUT'])
 @jwt_required
 def reorder_sub_categories():
     data = request.get_json()
-    for item in data:
-        sub = SubCategory.query.get(item['id'])
-        if sub: sub.display_order = item['display_order']
+    
+    db.session.bulk_update_mappings(SubCategory, data)
     db.session.commit()
+    
     return jsonify({"message": "Sub-Category order updated"}), 200
 
-
-@core.route('/sub-categories', methods=['GET'])
-@jwt_required
-def get_sub_categories():
-    # Notice the order_by change here
-    subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
-    return jsonify([{"id": s.id, "name": s.name} for s in subs]), 200
-
 # --- UPDATED ADD PRODUCT ---
+
+# 1. Update the Main Category Swap
+@core.route('/categories/swap', methods=['PUT'])
+@jwt_required
+def swap_categories():
+    data = request.get_json()
+    cat1 = Category.query.get(data['id1'])
+    cat2 = Category.query.get(data['id2'])
+
+    if cat1 and cat2:
+        # Force explicit numbers passed from frontend
+        cat1.display_order = data['order1'] 
+        cat2.display_order = data['order2']
+        db.session.commit()
+        return jsonify({"message": "Items swapped successfully"}), 200
+        
+    return jsonify({"error": "Items not found"}), 404
+
+
+@core.route('/categories/<int:category_id>/sub-categories/swap', methods=['PUT'])
+@jwt_required
+def swap_contextual_sub_categories(category_id):
+    data = request.get_json()
+    sub_id1 = data['id1']
+    sub_id2 = data['id2']
+    order1 = data['order1'] # 👈 Take explicit numbers from frontend
+    order2 = data['order2']
+    
+    def update_or_create(sub_id, order_value):
+        mapping = CategorySubOrder.query.filter_by(category_id=category_id, sub_category_id=sub_id).first()
+        if not mapping:
+            mapping = CategorySubOrder(category_id=category_id, sub_category_id=sub_id)
+            db.session.add(mapping)
+        mapping.display_order = order_value # 👈 Force the exact number
+        return mapping
+
+    update_or_create(sub_id1, order1)
+    update_or_create(sub_id2, order2)
+    
+    db.session.commit()
+    return jsonify({"message": "Contextual swap successful"}), 200
+
+@core.route('/sub-categories/swap', methods=['PUT'])
+@jwt_required
+def swap_sub_categories():
+    data = request.get_json()
+    item1 = SubCategory.query.get(data['id1'])
+    item2 = SubCategory.query.get(data['id2'])
+
+    if item1 and item2:
+        item1.display_order, item2.display_order = item2.display_order, item1.display_order
+        db.session.commit()
+        return jsonify({"message": "Items swapped successfully"}), 200
+        
+    return jsonify({"error": "Items not found"}), 404
 
 @core.route('/categories', methods=['POST'])
 @jwt_required
 def add_category():
     data = request.get_json()
-    if not data or 'name' not in data or 'display_order':
+    if not data or 'name' not in data:
         return jsonify({"error": "Category name is required"}), 400
         
     new_cat = Category(
@@ -1602,6 +1664,13 @@ def delete_category(cat_id):
     db.session.commit()
     return jsonify({"message": "Category deleted successfully"}), 200
 
+
+@core.route('/sub-categories', methods=['GET'])
+@jwt_required
+def get_sub_categories():
+    subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
+    # We include display_order so the frontend knows how to sort them globally
+    return jsonify([{"id": s.id, "name": s.name, "display_order": s.display_order} for s in subs]), 200
 
 @core.route('/sub-categories', methods=['POST'])
 @jwt_required

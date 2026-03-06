@@ -9,6 +9,7 @@ from .analytics.routes import analytics_bp
 from .core.routes import core
 from .attendance.routes import attendance
 
+
 from .common.errors import register_error_handlers
 from .common.logging import setup_logging
 
@@ -33,6 +34,7 @@ def create_app():
     from app.models.transaction import Transaction
     from app.models.supplier import Supplier
     from app.models.attendance import Attendance
+    from app.models.categorysuborder import CategorySubOrder
 
 
 
