@@ -1973,7 +1973,6 @@ def get_contractor_stock(id):
 #     except Exception as e:
 #         print(f"Error: {e}")
 #         return jsonify({"error": "Failed to fetch supplier data"}), 500
-
 @core.route("/suppliers/<int:id>/products", methods=["GET"])
 @jwt_required
 def get_supplier_products(id): 
@@ -1982,7 +1981,6 @@ def get_supplier_products(id):
 
         # --- MODE 1: Drill Down (Transaction History) ---
         if product_id:
-            # 👇 ADD .options() HERE
             transactions = Transaction.query.options(
                 joinedload(Transaction.product),
                 joinedload(Transaction.supplier),
@@ -1996,11 +1994,11 @@ def get_supplier_products(id):
             return jsonify([t.to_dict() for t in transactions]), 200
 
         # --- MODE 2: Consolidated View (Main Table) ---
-        # We use a case statement to subtract 'return' from 'in'
         results = db.session.query(
             Product.id,
             Product.name,
             Product.product_code,
+            Product.current_stock, # 👈 1. ADD THIS TO SELECT
             func.sum(
                 db.case(
                     (func.lower(Transaction.type) == 'in', Transaction.quantity),
@@ -2014,8 +2012,8 @@ def get_supplier_products(id):
              Transaction.supplier_id == id,
              func.lower(Transaction.type).in_(['in', 'return'])
          )\
-         .group_by(Product.id)\
-         .all()
+         .group_by(Product.id, Product.name, Product.product_code, Product.current_stock)\
+         .all() # 👈 2. ADD TO GROUP BY
 
         data = []
         for r in results:
@@ -2023,7 +2021,8 @@ def get_supplier_products(id):
                 "id": r.id,
                 "name": r.name,
                 "sku": r.product_code,
-                "total_supplied": float(r.total_supplied or 0), # Ensure it's a number
+                "current_stock": float(r.current_stock or 0), # 👈 3. ADD TO RESPONSE
+                "total_supplied": float(r.total_supplied or 0), 
                 "last_supplied": r.last_supplied.strftime('%Y-%m-%d') if r.last_supplied else "N/A"
             })
 
