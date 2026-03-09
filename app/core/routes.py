@@ -111,58 +111,68 @@ def stock_operation():
     # ==========================================
     supplier_id = data.get('supplier_id')
     contractor_id = data.get('contractor_id')
-    default_name = "Manual Adjustment"
 
     if op_type == 'in':
+        sup_name = data.get('supplier_name', '').strip()
+        if not sup_name and not supplier_id:
+            return jsonify({"error": "Supplier Name is strictly required to add stock."}), 400
+            
         product.current_stock += qty
-        sup_name = (data.get('supplier_name') or default_name).strip()
-        supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-        if not supplier:
-            supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
-            db.session.add(supplier)
-            db.session.flush()
-        supplier_id = supplier.id
         
-    elif op_type == 'out':
-        if product.current_stock < qty:
-            return jsonify({"error": f"Insufficient stock ({product.current_stock})"}), 400
-        product.current_stock -= qty
-        cont_name = (data.get('contractor_name') or default_name).strip()
-        contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-        if not contractor:
-            contractor = Contractor(name=cont_name, is_active=True)
-            db.session.add(contractor)
-            db.session.flush()
-        contractor_id = contractor.id
-
-    elif op_type == 'return':
-        
-        # Scenario A: Returning defective stock TO a Supplier
-        if data.get('supplier_name'):
-            if product.current_stock < qty:
-                return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
-            
-            product.current_stock -= qty  # Stock goes DOWN
-            sup_name = data.get('supplier_name').strip()
-            
+        if not supplier_id:
             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-            if not supplier:
+            if not supplier: # 👇 Now nested correctly inside 'if not supplier_id'
                 supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
                 db.session.add(supplier)
                 db.session.flush()
             supplier_id = supplier.id
-
-        # Scenario B: Receiving unused stock FROM a Contractor
-        else:
-            product.current_stock += qty  # Stock goes UP
-            cont_name = (data.get('contractor_name') or default_name).strip()
+        
+    elif op_type == 'out':
+        cont_name = data.get('contractor_name', '').strip()
+        if not cont_name and not contractor_id:
+            return jsonify({"error": "Contractor Name is strictly required to issue stock."}), 400
             
+        if product.current_stock < qty:
+            return jsonify({"error": f"Insufficient stock ({product.current_stock})"}), 400
+        product.current_stock -= qty
+        
+        if not contractor_id:
             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-            if not contractor:
+            if not contractor: # 👇 Now nested correctly inside 'if not contractor_id'
                 contractor = Contractor(name=cont_name, is_active=True)
                 db.session.add(contractor)
                 db.session.flush()
             contractor_id = contractor.id
+
+    elif op_type == 'return':
+        sup_name = data.get('supplier_name', '').strip()
+        cont_name = data.get('contractor_name', '').strip()
+
+        if not sup_name and not cont_name and not supplier_id and not contractor_id:
+             return jsonify({"error": "A Supplier or Contractor is strictly required to process a return."}), 400
+        
+        if sup_name or supplier_id:
+            if product.current_stock < qty:
+                return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
+            product.current_stock -= qty
+            
+            if not supplier_id:
+                supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+                if not supplier: # 👇 Nested correctly
+                    supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+                    db.session.add(supplier)
+                    db.session.flush()
+                supplier_id = supplier.id
+
+        elif cont_name or contractor_id:
+            product.current_stock += qty  
+            if not contractor_id:
+                contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+                if not contractor: # 👇 Nested correctly
+                    contractor = Contractor(name=cont_name, is_active=True)
+                    db.session.add(contractor)
+                    db.session.flush()
+                contractor_id = contractor.id
 
     # Create Transaction using the correct product.id
     txn = Transaction(
@@ -479,54 +489,57 @@ def get_products():
 @jwt_required
 def update_product(id):
     try:
-        # 1. Find Product
         product = Product.query.get(id)
         if not product: 
             return jsonify({"error": "Product not found"}), 404
 
         active_dept = get_active_department()
-        
-        # 2. Security Check (Allow Admin OR Department Owner)
-        # Note: We check if role is NOT Admin AND Dept doesn't match
         if g.role != 'ADMIN' and product.department_id != active_dept:
             return jsonify({"error": "Unauthorized"}), 403
 
         data = request.get_json()
         
-        # 3. Update Name
-        if 'name' in data and data['name']:
-            product.name = data['name']
+        # 🛡️ VALIDATE NAME
+        if 'name' in data:
+            new_name = data['name']
+            if not new_name or not str(new_name).strip():
+                return jsonify({"error": "Product name cannot be empty."}), 400
+            product.name = str(new_name).strip()
 
-        # 4. Update SKU (With Duplicate Check)
-        if 'sku' in data and data['sku']:
-            new_sku = data['sku'].strip()
-            # Only check if the SKU is actually changing
+        # 🛡️ VALIDATE SKU
+        if 'sku' in data:
+            new_sku = data['sku']
+            if not new_sku or not str(new_sku).strip():
+                return jsonify({"error": "Product SKU cannot be empty."}), 400
+            new_sku = str(new_sku).strip()
             if new_sku != product.product_code:
-                # Check if this SKU exists elsewhere
                 product.product_code = new_sku
         
-        # 5. Update Min Stock (Safe Conversion)
+        # 🛑 VALIDATE MIN STOCK (No Negatives)
         if 'min_stock' in data: 
             try: 
                 val = data['min_stock']
-                # Handle empty strings or nulls by defaulting to 0
                 if val == "" or val is None:
                     product.min_stock = 0.0
                 else:
-                    product.min_stock = float(val)
+                    parsed_val = float(val)
+                    if parsed_val < 0: return jsonify({"error": "Min stock cannot be negative."}), 400
+                    product.min_stock = parsed_val
             except ValueError: 
-                pass # Ignore invalid numbers (keep old value)
+                return jsonify({"error": "Invalid number for min stock."}), 400
         
-        # 6. Update Max Stock (Safe Conversion)
+        # 🛑 VALIDATE MAX STOCK (No Negatives)
         if 'max_stock' in data:
             try: 
                 val = data['max_stock']
                 if val == "" or val is None:
                     product.max_stock = 0.0
                 else:
-                    product.max_stock = float(val)
+                    parsed_val = float(val)
+                    if parsed_val < 0: return jsonify({"error": "Max stock cannot be negative."}), 400
+                    product.max_stock = parsed_val
             except ValueError: 
-                pass 
+                return jsonify({"error": "Invalid number for max stock."}), 400 
 
         if 'category_name' in data:
             cat_name = data['category_name'].strip().upper()
@@ -535,10 +548,9 @@ def update_product(id):
                 if not category:
                     category = Category(name=cat_name)
                     db.session.add(category)
-                    db.session.flush() # Get ID
+                    db.session.flush() 
                 product.category_id = category.id
 
-        # 8. Update Sub-Category (Upsert Logic)
         if 'sub_category_name' in data:
             sub_name = data['sub_category_name'].strip().upper()
             if sub_name:
@@ -546,9 +558,8 @@ def update_product(id):
                 if not sub_cat:
                     sub_cat = SubCategory(name=sub_name)
                     db.session.add(sub_cat)
-                    db.session.flush() # Get ID
+                    db.session.flush() 
                 product.sub_category_id = sub_cat.id
- 
 
         db.session.commit()
         return jsonify({"message": "Product updated"}), 200
@@ -557,7 +568,7 @@ def update_product(id):
         db.session.rollback()
         print(f"Update Product Error: {str(e)}") 
         return jsonify({"error": f"Server Error: {str(e)}"}), 500
-    
+
 @core.route('/pending-users', methods=['GET'])
 @jwt_required
 @admin_only
@@ -1323,44 +1334,42 @@ def update_department(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500  
-
-
 @core.route('/suppliers', methods=['POST'])
 @jwt_required
 def add_supplier():
     data = request.get_json()
-    
-    # --- 1. Basic Validation ---
-    if not data.get('name'):
-        return jsonify({"error": "Supplier Name is required"}), 400
-        
-    phone = data.get('phone')
-    if phone:
-        # Remove spaces/dashes to check just digits
-        clean_phone = ''.join(filter(str.isdigit, str(phone)))
-        if len(clean_phone) != 10:
-            return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
-    
     active_dept = get_active_department()
+
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    # --- 2. Check Duplicate ---
-    existing = Supplier.query.filter(
-        Supplier.name.ilike(data['name']), 
-        Supplier.department_id == active_dept
-    ).first()
-    
-    if existing:
-        if not existing.is_active:
-             return jsonify({"error": "Supplier exists but is in Recycle Bin. Restore it instead."}), 400
-        return jsonify({"error": "Supplier already exists"}), 400
+    # 🛡️ VALIDATE NAME
+    name = data.get('name')
+    if not name or not str(name).strip():
+        return jsonify({"error": "Supplier Name is required and cannot be empty."}), 400
+    name = str(name).strip()
+        
+    phone = data.get('phone')
+    clean_phone = None
+    if phone:
+        clean_phone = ''.join(filter(str.isdigit, str(phone)))
+        if len(clean_phone) != 10:
+            return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
 
-    # --- 3. Create ---
     try:
+        existing = Supplier.query.filter(
+            Supplier.name.ilike(name), 
+            Supplier.department_id == active_dept
+        ).first()
+        
+        if existing:
+            if not existing.is_active:
+                 return jsonify({"error": "Supplier exists but is in Recycle Bin. Restore it instead."}), 400
+            return jsonify({"error": "Supplier already exists"}), 400
+
         new_supplier = Supplier(
-            name=data['name'],
-            phone_number=phone, 
+            name=name,
+            phone_number=clean_phone, 
             department_id=active_dept,
             is_active=True
         )
@@ -1374,9 +1383,8 @@ def add_supplier():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-
+        return jsonify({"error": "Failed to add supplier", "details": str(e)}), 500
+    
 @core.route('/supplier-transactions', methods=['GET'])
 @jwt_required
 def supplier_transaction_report():
@@ -1442,7 +1450,6 @@ def get_suppliers():
          suppliers = Supplier.query.filter_by(is_active=True, department_id=active_dept).all()
     
     return jsonify([s.to_dict() for s in suppliers]), 200
-
 @core.route('/suppliers/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
@@ -1453,8 +1460,14 @@ def update_supplier(id):
 
     data = request.get_json()
     
-    if 'name' in data: supplier.name = data['name']
-    if 'phone' in data: supplier.phone_number = data['phone'] # Assuming column is phone_number
+    # 🛡️ VALIDATE NAME
+    if 'name' in data: 
+        new_name = data['name']
+        if not new_name or not str(new_name).strip():
+            return jsonify({"error": "Supplier name cannot be empty."}), 400
+        supplier.name = str(new_name).strip()
+        
+    if 'phone' in data: supplier.phone_number = data['phone'] 
     
     try:
         db.session.commit()
@@ -1473,8 +1486,12 @@ def update_contractor(id):
 
     data = request.get_json()
     
-    if 'name' in data: contractor.name = data['name']
-    # Add other fields if your Contractor model has them (e.g. phone, address)
+    # 🛡️ VALIDATE NAME
+    if 'name' in data: 
+        new_name = data['name']
+        if not new_name or not str(new_name).strip():
+            return jsonify({"error": "Contractor name cannot be empty."}), 400
+        contractor.name = str(new_name).strip()
 
     try:
         db.session.commit()
@@ -1496,30 +1513,30 @@ def get_contractors():
 def add_contractor():
     data = request.get_json()
 
-    # --- 1. Basic Validation ---
-    if not data.get('name'):
-        return jsonify({"error": "Contractor Name is required"}), 400
+    # 🛡️ VALIDATE NAME
+    name = data.get('name')
+    if not name or not str(name).strip():
+        return jsonify({"error": "Contractor Name is required and cannot be empty."}), 400
+    name = str(name).strip()
 
     phone = data.get('phone')
+    clean_phone = None
     if phone:
-        # Remove spaces/dashes to check just digits
         clean_phone = ''.join(filter(str.isdigit, str(phone)))
         if len(clean_phone) != 10:
             return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
 
-    # --- 2. Check Duplicate ---
-    existing = Contractor.query.filter(Contractor.name.ilike(data['name'])).first()
-    
-    if existing:
-        if not existing.is_active:
-             return jsonify({"error": "Contractor exists but is in Recycle Bin. Restore it instead."}), 400
-        return jsonify({"error": "Contractor already exists"}), 400
-
-    # --- 3. Create ---
     try:
+        existing = Contractor.query.filter(Contractor.name.ilike(name)).first()
+        
+        if existing:
+            if not existing.is_active:
+                 return jsonify({"error": "Contractor exists but is in Recycle Bin. Restore it instead."}), 400
+            return jsonify({"error": "Contractor already exists"}), 400
+
         new_contractor = Contractor(
-            name=data['name'],
-            phone=phone, 
+            name=name,
+            phone=clean_phone, 
             is_active=True
         )
         db.session.add(new_contractor)
@@ -1532,8 +1549,8 @@ def add_contractor():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-    
+        return jsonify({"error": "Failed to add contractor", "details": str(e)}), 500
+
 @core.route('/categories', methods=['GET'])
 @jwt_required
 def get_categories():
@@ -1745,54 +1762,135 @@ def delete_sub_category(sub_id):
 #     db.session.commit()
 #     return jsonify({"message": "Product created", "id": new_p.id}), 201
 
+# @core.route('/products', methods=['POST'])
+# @jwt_required
+# def add_product():
+#     data = request.get_json()
+#     active_dept = get_active_department()
+
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+        
+#     # 🛡️ THE GATEKEEPER: Stop empty products dead in their tracks
+#     product_name = data.get('name', '').strip()
+#     if not product_name:
+#         return jsonify({"error": "Product Name is required and cannot be empty."}), 400
+        
+#     sku = data.get('product_code', data.get('sku', '')).strip()
+#     if not sku:
+#         return jsonify({"error": "Product SKU is required."}), 400
+
+#     active_dept = get_active_department()
+
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+    
+    
+#     # 1. Handle Category (Get existing or create new)
+#     cat_name = data.get('category_name', 'OTHER').strip().upper()
+#     category = Category.query.filter_by(name=cat_name).first()
+#     if not category:
+#         category = Category(name=cat_name)
+#         db.session.add(category)
+#         db.session.flush() # Get ID before product creation
+
+#     # 2. Handle Sub-Category (Get existing or create new)
+#     sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
+#     sub_category = SubCategory.query.filter_by(name=sub_name).first()
+#     if not sub_category:
+#         sub_category = SubCategory(name=sub_name)
+#         db.session.add(sub_category)
+#         db.session.flush()
+
+#     # 3. Create Product
+#     new_product = Product(
+#         name=data['name'],
+#         # ✅ FIX: Use .get() to check for 'product_code' first, then fallback to 'sku'
+#         product_code=data.get('product_code', data.get('sku', '')), 
+#         category_id=category.id,
+#         sub_category_id=sub_category.id,
+#         department_id=active_dept,
+#         current_stock=data.get('qty', 0),
+#         min_stock=data.get('min_stock', 10),
+#         max_stock=data.get('max_stock', 100),
+#         unit=data.get('unit', 'pcs')
+#     )
+    
+#     db.session.add(new_product)
+#     db.session.commit()
+    
+#     # Clean up any previously orphaned categories (typos from previous edits)
+    
+#     return jsonify({"message": "Product added successfully"}), 201
+
+
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
     data = request.get_json()
-
     active_dept = get_active_department()
 
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
-    
-    # 1. Handle Category (Get existing or create new)
-    cat_name = data.get('category_name', 'OTHER').strip().upper()
-    category = Category.query.filter_by(name=cat_name).first()
-    if not category:
-        category = Category(name=cat_name)
-        db.session.add(category)
-        db.session.flush() # Get ID before product creation
+        
+    # 🛡️ VALIDATE NAMES
+    product_name = data.get('name')
+    if not product_name or not str(product_name).strip():
+        return jsonify({"error": "Product Name is required and cannot be empty."}), 400
+    product_name = str(product_name).strip()
+        
+    sku = data.get('product_code', data.get('sku'))
+    if not sku or not str(sku).strip():
+        return jsonify({"error": "Product SKU is required."}), 400
+    sku = str(sku).strip()
 
-    # 2. Handle Sub-Category (Get existing or create new)
-    sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
-    sub_category = SubCategory.query.filter_by(name=sub_name).first()
-    if not sub_category:
-        sub_category = SubCategory(name=sub_name)
-        db.session.add(sub_category)
-        db.session.flush()
+    # 🛑 VALIDATE NUMBERS (No Negatives!)
+    try:
+        qty = float(data.get('qty', 0))
+        min_stock = float(data.get('min_stock', 10))
+        max_stock = float(data.get('max_stock', 100))
+        
+        if qty < 0 or min_stock < 0 or max_stock < 0:
+            return jsonify({"error": "Quantities and stock limits cannot be negative."}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid numeric values provided."}), 400
 
-    # 3. Create Product
-    new_product = Product(
-        name=data['name'],
-        # ✅ FIX: Use .get() to check for 'product_code' first, then fallback to 'sku'
-        product_code=data.get('product_code', data.get('sku', '')), 
-        category_id=category.id,
-        sub_category_id=sub_category.id,
-        department_id=active_dept,
-        current_stock=data.get('qty', 0),
-        min_stock=data.get('min_stock', 10),
-        max_stock=data.get('max_stock', 100),
-        unit=data.get('unit', 'pcs')
-    )
-    
-    db.session.add(new_product)
-    db.session.commit()
-    
-    # Clean up any previously orphaned categories (typos from previous edits)
-    
-    return jsonify({"message": "Product added successfully"}), 201
+    try:
+        existing_product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
+        if existing_product:
+            return jsonify({"error": f"Product with SKU '{sku}' already exists."}), 400
 
+        cat_name = data.get('category_name', 'OTHER').strip().upper()
+        category = Category.query.filter_by(name=cat_name).first()
+        if not category:
+            category = Category(name=cat_name)
 
+        sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
+        sub_category = SubCategory.query.filter_by(name=sub_name).first()
+        if not sub_category:
+            sub_category = SubCategory(name=sub_name)
+
+        new_product = Product(
+            name=product_name,
+            product_code=sku,
+            category_rel=category,       
+            sub_category_rel=sub_category, 
+            department_id=active_dept,
+            current_stock=qty,
+            min_stock=min_stock,
+            max_stock=max_stock,
+            unit=data.get('unit', 'pcs')
+        )
+        
+        db.session.add(new_product)
+        db.session.commit() 
+        
+        return jsonify({"message": "Product added successfully", "id": new_product.id}), 201
+
+    except Exception as e:
+        db.session.rollback() 
+        return jsonify({"error": "Server error while adding product", "details": str(e)}), 500
+    
 @core.route('/products/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
