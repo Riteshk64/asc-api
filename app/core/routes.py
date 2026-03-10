@@ -876,13 +876,20 @@ def get_recycle_bin():
 
     # --- Contractors (Usually Global, but can be filtered if needed) ---
     contractors = Contractor.query.filter_by(is_active=False).all()
+
+    categories = Category.query.filter_by(is_active=False).all()
+    sub_categories = SubCategory.query.filter_by(is_active=False).all()
     
     return jsonify({
         "transactions": [t.to_dict() for t in txns],
         "products": [p.to_dict() for p in products],
         "suppliers": [s.to_dict() for s in suppliers],
-        "contractors": [c.to_dict() for c in contractors]
+        "contractors": [c.to_dict() for c in contractors],
+        "categories": [c.to_dict() for c in categories], # 👈
+        "sub_categories": [s.to_dict() for s in sub_categories] # 👈
     }), 200
+    
+    
 
 @core.route('/recycle-bin/<string:type>/<int:id>/restore', methods=['PUT'])
 @jwt_required
@@ -973,67 +980,99 @@ def restore_any_entity(type, id):
             )
             db.session.add(log)
 
+        elif type == 'category':
+            cat = Category.query.get(id)
+            if not cat: return jsonify({"error": "Category not found"}), 404
+            cat.is_active = True
+            db.session.add(cat)
+            
+        elif type == 'sub_category':
+            sub = SubCategory.query.get(id)
+            if not sub: return jsonify({"error": "Sub-Category not found"}), 404
+            sub.is_active = True
+            db.session.add(sub)
+
+          
+
         else:
             return jsonify({"error": "Invalid entity type"}), 400
 
         # Commit whatever happened above
         db.session.commit()
-        return jsonify({"message": f"{type.capitalize()} restored successfully"}), 200
-
+        return jsonify({"message": f"{type.replace('_', '-').title()} restored successfully"}), 200
+        
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500  
 
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
 def delete_transaction(id):
-
+    """
+    Soft-deletes a transaction (moves to Recycle Bin) and accurately 
+    reverses its historical impact on the current product stock.
+    """
     txn = Transaction.query.get(id)
-    if not txn: return jsonify({"error": "Transaction not found"}), 404
+    if not txn: 
+        return jsonify({"error": "Transaction not found"}), 404
 
     # Permission Check: Only Admin or the Department that owns the product
-    if g.role != 'ADMIN' and txn.product.department_id != g.department_id:
-         return jsonify({"error": "Unauthorized"}), 403
+    active_dept = get_active_department()
+    if g.role != 'ADMIN' and txn.product.department_id != active_dept:
+         return jsonify({"error": "Unauthorized to delete this transaction"}), 403
 
     product = txn.product
 
-    # === REVERSE STOCK IMPACT ===
-    
+    # ==========================================
+    # REVERSE STOCK IMPACT
+    # ==========================================
     if txn.type == 'in':
+        # Reversing 'in' means deducting the stock that was added
         if product.current_stock < txn.quantity:
              return jsonify({"error": "Cannot delete: Stock would become negative"}), 400
         product.current_stock -= txn.quantity
+        
     elif txn.type == 'out':
+        # Reversing 'out' means adding the stock back to inventory
         product.current_stock += txn.quantity
+        
     elif txn.type == 'return':
         if txn.supplier_id:
-            # You originally gave it away -> Deleting the record puts it BACK (+)
+            # You originally returned items TO the supplier (Stock went down)
+            # Deleting the record puts it BACK into your inventory (+)
             product.current_stock += txn.quantity
         else:
-            # Contractor originally gave it back -> Deleting the record REMOVES it (-)
+            # Contractor originally returned items TO you (Stock went up)
+            # Deleting the record REMOVES it from your inventory (-)
             if product.current_stock < txn.quantity:
                  return jsonify({"error": "Cannot delete return: Stock would become negative"}), 400
             product.current_stock -= txn.quantity
 
+    # 1. Soft Delete the transaction
     txn.is_active = False
-    
+
+    # 2. Log the activity
     log = ActivityLog(
         user_id=g.current_user.id,
         action=f"Moved Txn #{txn.id} to Recycle Bin",
         transaction_id=txn.id
     )
+    
+    # 3. Stage changes
     db.session.add(log)
     db.session.add(product)
 
+    # 4. Commit to database
     try:
         db.session.commit()
         return jsonify({
             "message": "Transaction moved to Recycle Bin", 
             "new_stock": product.current_stock
         }), 200
+        
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500   
+        return jsonify({"error": f"Database error: {str(e)}"}), 500   
 
 @core.route('/recycle-bin/<string:type>/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -1659,11 +1698,13 @@ def add_category():
     new_cat = Category(
         name=data['name'], 
         display_order=data.get('display_order', 0),
-        match_codes=data.get('match_codes', '') # 👈 Add this
+        is_active=True  # 👈 Added this to support your new Recycle Bin logic
+        # 💥 Removed match_codes
     )
     db.session.add(new_cat)
     db.session.commit()
     return jsonify({"message": "Category added successfully", "id": new_cat.id}), 201
+
 
 @core.route('/categories/<int:cat_id>', methods=['DELETE'])
 @jwt_required
@@ -1672,15 +1713,19 @@ def delete_category(cat_id):
     if not cat:
         return jsonify({"error": "Category not found"}), 404
         
-    # Optional: Check if products depend on this category before deleting
-    # if Product.query.filter_by(category_id=cat_id).first():
-    #     return jsonify({"error": "Cannot delete category with associated products"}), 400
+    # 🛡️ THE SHIELD: Prevent deletion if ANY product is using it
+    product_using_cat = Product.query.filter_by(category_id=cat_id).first()
+    if product_using_cat:
+        return jsonify({"error": "Cannot delete. There are products currently assigned to this category."}), 400
+
+    try:
+        cat.is_active = False # 👈 Soft Delete
+        db.session.commit()
+        return jsonify({"message": "Category moved to Recycle Bin"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
     
-
-    db.session.delete(cat)
-    db.session.commit()
-    return jsonify({"message": "Category deleted successfully"}), 200
-
 
 @core.route('/sub-categories', methods=['GET'])
 @jwt_required
@@ -1688,7 +1733,6 @@ def get_sub_categories():
     subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
     # We include display_order so the frontend knows how to sort them globally
     return jsonify([{"id": s.id, "name": s.name, "display_order": s.display_order} for s in subs]), 200
-
 @core.route('/sub-categories', methods=['POST'])
 @jwt_required
 def add_sub_category():
@@ -1699,7 +1743,8 @@ def add_sub_category():
     new_sub = SubCategory(
         name=data['name'], 
         display_order=data.get('display_order', 0),
-        match_rule=data.get('match_rule', 'first_word')
+        is_active=True  # 👈 Added this to support your new Recycle Bin logic
+        # 💥 Removed match_rule
     )
     db.session.add(new_sub)
     db.session.commit()
@@ -1712,15 +1757,18 @@ def delete_sub_category(sub_id):
     if not sub:
         return jsonify({"error": "Sub-Category not found"}), 404
         
-    # Prevent deletion if products are currently using this sub-category
-    # if Product.query.filter_by(sub_category_id=sub_id).first():
-    #     return jsonify({"error": "Cannot delete sub-category with associated products"}), 400
+    # 🛡️ THE SHIELD: Prevent deletion if ANY product is using it
+    product_using_sub = Product.query.filter_by(sub_category_id=sub_id).first()
+    if product_using_sub:
+        return jsonify({"error": "Cannot delete. There are products currently assigned to this sub-category."}), 400
 
-    db.session.delete(sub)
-    db.session.commit()
-    return jsonify({"message": "Sub-Category deleted successfully"}), 200
-
-
+    try:
+        sub.is_active = False # 👈 Soft Delete
+        db.session.commit()
+        return jsonify({"message": "Sub-Category moved to Recycle Bin"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
 # @core.route('/products', methods=['POST'])
 # @jwt_required
 # def add_product():
