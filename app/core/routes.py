@@ -1856,9 +1856,7 @@ def add_product():
         return jsonify({"error": "Invalid numeric values provided."}), 400
 
     try:
-        existing_product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
-        if existing_product:
-            return jsonify({"error": f"Product with SKU '{sku}' already exists."}), 400
+        
 
         cat_name = data.get('category_name', 'OTHER').strip().upper()
         category = Category.query.filter_by(name=cat_name).first()
