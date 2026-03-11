@@ -103,8 +103,11 @@ def stock_operation():
         db.session.flush()
 
     # Security check
-    if product.department_id != active_dept:
+    if product.department_id != active_dept and g.role != 'ADMIN':
         return jsonify({"error": "Cross-department operation blocked"}), 403
+
+    # 👇 FIX 2: Ensure the transaction is logged under the Product's true department
+    txn_dept_id = product.department_id
 
     # ==========================================
     # 3. STOCK LOGIC (UNCHANGED)
@@ -181,7 +184,7 @@ def stock_operation():
         quantity=qty,
         supplier_id=supplier_id or data.get('supplier_id'),
         contractor_id=contractor_id or data.get('contractor_id'),
-        department_id=active_dept,
+        department_id=txn_dept_id, # 👈 CHANGED THIS LINE
         created_by=g.current_user.id,
         is_active=True 
     )
@@ -393,7 +396,6 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import joinedload # 👈 Ensure this is imported at the top
-
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -404,53 +406,60 @@ def get_products():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
 
-    # IF FILTER IS ACTIVE:
+    # ==========================================
+    # 1. BUILD THE ULTRA-FAST SUBQUERY
+    # ==========================================
+    # We tell SQL to do the math first, grouped ONLY by the product_id
+    txn_query = db.session.query(
+        Transaction.product_id,
+        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
+        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
+    ).filter(Transaction.is_active == True)
+
+    # Apply date filters to the math if the frontend asks for them
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
             end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            
-            results = db.session.query(
-                Product,
-                func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
-                              (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
-                func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
-                              (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-            ).options(
-                # 👇 THIS IS THE MAGIC THAT FIXES THE 9-SECOND DELAY
-                joinedload(Product.category_rel),
-                joinedload(Product.sub_category_rel)
-            ).outerjoin(Transaction, and_(
-                Transaction.product_id == Product.id, 
-                Transaction.is_active == True,
-                Transaction.created_at.between(start_date, end_date)
-            )).filter(
-                Product.department_id == active_dept, 
-                Product.is_active == True
-            ).group_by(Product.id).all()
-
-            data = []
-            for p, t_in, t_out in results:
-                p_dict = p.to_dict()
-                p_dict['total_stock_in'] = float(t_in or 0)
-                p_dict['total_stock_out'] = float(t_out or 0)
-                data.append(p_dict)
-            return jsonify(data), 200
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
         except ValueError:
             pass
 
-    # ALL TIME DATA (NO DATE FILTER):
-    # 👇 ADD JOINEDLOAD HERE AS WELL!
-    products = Product.query.options(
+    # Turn this query into a temporary SQL table
+    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
+
+    # ==========================================
+    # 2. MAIN QUERY (No Grouping Error!)
+    # ==========================================
+    # Because the math is already done in the subquery, the main query doesn't need GROUP BY.
+    # This allows joinedload() to fetch the Categories instantly without PostgreSQL complaining.
+    results = db.session.query(
+        Product,
+        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
+        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
+    ).outerjoin(
+        txn_subq, Product.id == txn_subq.c.product_id
+    ).options(
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
-    ).filter_by(
-        is_active=True, 
-        department_id=active_dept
+    ).filter(
+        Product.department_id == active_dept, 
+        Product.is_active == True
     ).all()
-    
-    return jsonify([p.to_dict() for p in products]), 200
 
+    # ==========================================
+    # 3. FORMAT THE RESPONSE
+    # ==========================================
+    data = []
+    for p, t_in, t_out in results:
+        p_dict = p.to_dict()
+        p_dict['total_stock_in'] = float(t_in)
+        p_dict['total_stock_out'] = float(t_out)
+        data.append(p_dict)
+        
+    return jsonify(data), 200
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
