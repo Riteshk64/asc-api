@@ -895,10 +895,9 @@ def get_recycle_bin():
 @jwt_required
 @admin_only
 def restore_any_entity(type, id):
-    
     try:
         # ====================================================
-        # 1. RESTORE SUPPLIER
+        # 1. RESTORE SUPPLIER & CASCADE RESTORE TRANSACTIONS
         # ====================================================
         if type == 'supplier':
             supplier = Supplier.query.get(id)
@@ -907,12 +906,27 @@ def restore_any_entity(type, id):
             supplier.is_active = True
             db.session.add(supplier)
             
-            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Supplier: {supplier.name}")
+            # Find and restore all their deleted transactions
+            txns = Transaction.query.filter_by(supplier_id=id, is_active=False).all()
+            for txn in txns:
+                # Only adjust stock if the product wasn't permanently deleted
+                if txn.product and txn.product.is_active:
+                    if txn.type == 'in':
+                        txn.product.current_stock += txn.quantity # Put the stock back
+                    elif txn.type == 'return':
+                        if txn.product.current_stock < txn.quantity:
+                            return jsonify({"error": f"Cannot restore supplier: Not enough stock of '{txn.product.name}' to re-apply past returns."}), 400
+                        txn.product.current_stock -= txn.quantity # Take the returned stock out again
+                
+                txn.is_active = True
+                db.session.add(txn)
+
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Supplier & Transactions: {supplier.name}"[:50])
             db.session.add(log)
 
 
         # ====================================================
-        # 2. RESTORE CONTRACTOR
+        # 2. RESTORE CONTRACTOR & CASCADE RESTORE TRANSACTIONS
         # ====================================================
         elif type == 'contractor':
             contractor = Contractor.query.get(id)
@@ -921,7 +935,21 @@ def restore_any_entity(type, id):
             contractor.is_active = True
             db.session.add(contractor)
             
-            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Contractor: {contractor.name}")
+            # Find and restore all their deleted transactions
+            txns = Transaction.query.filter_by(contractor_id=id, is_active=False).all()
+            for txn in txns:
+                if txn.product and txn.product.is_active:
+                    if txn.type == 'out':
+                        if txn.product.current_stock < txn.quantity:
+                            return jsonify({"error": f"Cannot restore contractor: Not enough stock of '{txn.product.name}' to re-apply past outputs."}), 400
+                        txn.product.current_stock -= txn.quantity # Deduct the stock they took
+                    elif txn.type == 'return':
+                        txn.product.current_stock += txn.quantity # Add the stock they returned back
+                
+                txn.is_active = True
+                db.session.add(txn)
+
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Contractor & Transactions: {contractor.name}"[:50])
             db.session.add(log)
 
 
@@ -932,12 +960,10 @@ def restore_any_entity(type, id):
             product = Product.query.get(id)
             if not product: return jsonify({"error": "Product not found"}), 404
             
-            # Check if Department is active? (Optional)
-            
             product.is_active = True
             db.session.add(product)
             
-            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Product: {product.name}")
+            log = ActivityLog(user_id=g.current_user.id, action=f"Restored Product: {product.name}"[:50])
             db.session.add(log)
 
 
@@ -950,7 +976,7 @@ def restore_any_entity(type, id):
             product = txn.product
 
             if not product or not product.is_active:
-                return jsonify({"error": "Parent Product is deleted"}), 400
+                return jsonify({"error": "Cannot restore: Parent Product is deleted"}), 400
 
             # === RE-APPLY STOCK LOGIC ===
             if txn.type == 'in':
@@ -975,7 +1001,7 @@ def restore_any_entity(type, id):
             
             log = ActivityLog(
                 user_id=g.current_user.id, 
-                action=f"Restored Transaction #{txn.id}", 
+                action=f"Restored Transaction #{txn.id}"[:50], 
                 transaction_id=txn.id
             )
             db.session.add(log)
@@ -992,8 +1018,6 @@ def restore_any_entity(type, id):
             sub.is_active = True
             db.session.add(sub)
 
-          
-
         else:
             return jsonify({"error": "Invalid entity type"}), 400
 
@@ -1003,7 +1027,8 @@ def restore_any_entity(type, id):
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500  
+        return jsonify({"error": str(e)}), 500
+
 
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -1027,23 +1052,21 @@ def delete_transaction(id):
     # REVERSE STOCK IMPACT
     # ==========================================
     if txn.type == 'in':
-        # Reversing 'in' means deducting the stock that was added
+        # It was originally added. So we must subtract it.
         if product.current_stock < txn.quantity:
              return jsonify({"error": "Cannot delete: Stock would become negative"}), 400
         product.current_stock -= txn.quantity
         
     elif txn.type == 'out':
-        # Reversing 'out' means adding the stock back to inventory
+        # It was originally subtracted. So we must add it back.
         product.current_stock += txn.quantity
         
     elif txn.type == 'return':
         if txn.supplier_id:
-            # You originally returned items TO the supplier (Stock went down)
-            # Deleting the record puts it BACK into your inventory (+)
+            # Return TO supplier (Stock originally went down). We must add it back.
             product.current_stock += txn.quantity
         else:
-            # Contractor originally returned items TO you (Stock went up)
-            # Deleting the record REMOVES it from your inventory (-)
+            # Return FROM contractor (Stock originally went up). We must subtract it.
             if product.current_stock < txn.quantity:
                  return jsonify({"error": "Cannot delete return: Stock would become negative"}), 400
             product.current_stock -= txn.quantity
@@ -1072,107 +1095,56 @@ def delete_transaction(id):
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Database error: {str(e)}"}), 500   
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+
 
 @core.route('/recycle-bin/<string:type>/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
 def delete_permanently(type, id):
     try:
-        # ====================================================
         # 1. PERMANENT DELETE CONTRACTOR
-        # ====================================================
         if type == 'contractor':
             contractor = Contractor.query.get(id)
-            if not contractor: 
-                return jsonify({"error": "Contractor not found"}), 404
+            if not contractor: return jsonify({"error": "Contractor not found"}), 404
 
-            # Get all transactions linked to this contractor
             txns = Transaction.query.filter_by(contractor_id=id).all()
-
             for txn in txns:
-                # REVERSE THE TRANSACTION IMPACT
-                if txn.product:
-                    if txn.type == 'out':
-                        # They took stock -> We put it back
-                        txn.product.current_stock += txn.quantity
-                        
-                    elif txn.type == 'return':
-                        # They returned stock -> We remove it (undo the return)
-                        # Safety check: ensure we don't go negative
-                        if txn.product.current_stock >= txn.quantity:
-                            txn.product.current_stock -= txn.quantity
-                        else:
-                            # If we can't undo the return without going negative, 
-                            # it implies the returned stock was used elsewhere.
-                            # We force stock to 0 or leave it (business decision).
-                            txn.product.current_stock = 0
-
-                # Delete the transaction record
+                ActivityLog.query.filter_by(transaction_id=txn.id).delete() # 👈 Fixes FK Crash
                 db.session.delete(txn)
-
-            # Finally, delete the contractor
+            
             db.session.delete(contractor)
 
-
-        # ====================================================
         # 2. PERMANENT DELETE SUPPLIER
-        # ====================================================
         elif type == 'supplier':
             supplier = Supplier.query.get(id)
-            if not supplier: 
-                return jsonify({"error": "Supplier not found"}), 404
+            if not supplier: return jsonify({"error": "Supplier not found"}), 404
 
-            # Get all 'Stock In' transactions from this supplier
             txns = Transaction.query.filter_by(supplier_id=id).all()
-
-            products_to_delete = set()
-
             for txn in txns:
-                if txn.product_id in products_to_delete:
-                    continue # Skip if we already decided to delete this product
-
-                if txn.product:
-                    if txn.type == 'in':
-                        # Logic: We are removing the record of stock arrival.
-                        # So we must DEDUCT that stock from current inventory.
-                        
-                        if txn.product.current_stock >= txn.quantity:
-                            # Scenario A: We have enough stock to just remove it.
-                            txn.product.current_stock -= txn.quantity
-                            db.session.delete(txn)
-                        else:
-                            # Scenario B: The stock provided by this supplier is already gone (sold/used).
-                            # We cannot have negative stock. 
-                            # Per your instruction: DELETE THE PRODUCT ITSELF.
-                            products_to_delete.add(txn.product_id)
-
-            # Process the "Corrupted" Products (where stock would have gone negative)
-            for prod_id in products_to_delete:
-                product = Product.query.get(prod_id)
-                if product:
-                    # Delete ALL transactions for this product (clean wipe)
-                    Transaction.query.filter_by(product_id=prod_id).delete()
-                    # Delete the product
-                    db.session.delete(product)
-
-            # Finally, delete the supplier
+                ActivityLog.query.filter_by(transaction_id=txn.id).delete() # 👈 Fixes FK Crash
+                db.session.delete(txn)
+            
             db.session.delete(supplier)
 
-
-        # ====================================================
-        # 3. OTHER TYPES (Standard Logic)
-        # ====================================================
+        # 3. PERMANENT DELETE PRODUCT
         elif type == 'product':
             product = Product.query.get(id)
             if not product: return jsonify({"error": "Product not found"}), 404
             
-            Transaction.query.filter_by(product_id=id).delete()
+            txns = Transaction.query.filter_by(product_id=id).all()
+            for txn in txns:
+                ActivityLog.query.filter_by(transaction_id=txn.id).delete() # 👈 Fixes FK Crash
+                db.session.delete(txn)
+                
             db.session.delete(product)
 
+        # 4. PERMANENT DELETE TRANSACTION
         elif type == 'transaction':
             txn = Transaction.query.get(id)
             if not txn: return jsonify({"error": "Transaction not found"}), 404
+            
+            ActivityLog.query.filter_by(transaction_id=txn.id).delete() # 👈 Fixes FK Crash
             db.session.delete(txn)
 
         db.session.commit()
@@ -1181,7 +1153,6 @@ def delete_permanently(type, id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 @core.route('/employees', methods=['GET'])
 @jwt_required
@@ -1593,19 +1564,18 @@ def add_contractor():
 @core.route('/categories', methods=['GET'])
 @jwt_required
 def get_categories():
-    cats = Category.query.order_by(Category.display_order.asc()).all()
+    cats = Category.query.order_by(Category.display_order.asc(), Category.id.asc()).all()
+    
     result = []
     for c in cats:
-        # Fetch any custom sub-category orders for this specific category
         sub_orders_query = CategorySubOrder.query.filter_by(category_id=c.id).all()
-        # Convert to a fast dictionary: {"sub_category_id": display_order}
         sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
         
         result.append({
             "id": c.id, 
             "name": c.name, 
             "display_order": c.display_order,
-            "sub_orders": sub_orders_dict # 👈 We inject the custom orders here!
+            "sub_orders": sub_orders_dict
         })
     return jsonify(result), 200
 
@@ -1642,9 +1612,9 @@ def swap_categories():
     cat2 = Category.query.get(data['id2'])
 
     if cat1 and cat2:
-        # Force explicit numbers passed from frontend
-        cat1.display_order = data['order1'] 
-        cat2.display_order = data['order2']
+        # 👇 Perform a true swap using the database's existing values
+        cat1.display_order, cat2.display_order = cat2.display_order, cat1.display_order
+        
         db.session.commit()
         return jsonify({"message": "Items swapped successfully"}), 200
         
@@ -1972,28 +1942,44 @@ def delete_suppliers(id):
     active_dept = get_active_department()
 
     if not supplier: 
-        return jsonify({"error": "Supplier does not exist"}, 404)
+        return jsonify({"error": "Supplier does not exist"}), 404
     
     if active_dept and supplier.department_id != active_dept: 
-        return jsonify({"error": "User is not Authorized to make this action"}, 401)
-    
+        return jsonify({"error": "User is not Authorized to make this action"}), 401
 
     if supplier.is_active == False: 
-        return jsonify({"error": "Supplier is already inactive"}, 400)
-    
-    
+        return jsonify({"error": "Supplier is already inactive"}), 400
     
     supplier.is_active = False
 
+    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock
+    txns = Transaction.query.filter_by(supplier_id=id, is_active=True).all()
+    for txn in txns:
+        txn.is_active = False
+        if txn.product:
+            if txn.type == 'in':
+                if txn.product.current_stock >= txn.quantity:
+                    txn.product.current_stock -= txn.quantity
+                else:
+                    txn.product.current_stock = 0
+                    txn.product.is_active = False # Auto-trash product if stock corruption occurs
+            elif txn.type == 'return':
+                txn.product.current_stock += txn.quantity
+        
+        log = ActivityLog(
+            user_id=g.current_user.id if hasattr(g, 'current_user') else None, 
+            action=f"Auto-deleted Txn #{txn.id} (Supplier removed)", 
+            transaction_id=txn.id
+        )
+        db.session.add(log)
+
     try: 
         db.session.commit()
-        return jsonify({"message": "Supplier successfully removed"}, 200)
-    
+        return jsonify({"message": "Supplier and associated transactions successfully removed"}), 200
     except Exception as e: 
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
-    
+  
 @core.route('/contractors/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
@@ -2003,24 +1989,39 @@ def delete_contractor(id):
     if not contractor: 
         return jsonify({"error": "Contractor does not exist"}), 404
     
-    # --- Department Check (Optional) ---
-    # Only enable this if your Contractor model has a 'department_id' column
-    # if active_dept and contractor.department_id != active_dept: 
-    #     return jsonify({"error": "User is not Authorized to make this action"}, 401)
-    
     if contractor.is_active == False: 
         return jsonify({"error": "Contractor is already inactive"}), 400
     
     contractor.is_active = False
 
+    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock
+    txns = Transaction.query.filter_by(contractor_id=id, is_active=True).all()
+    for txn in txns:
+        txn.is_active = False
+        if txn.product:
+            if txn.type == 'out':
+                txn.product.current_stock += txn.quantity
+            elif txn.type == 'return':
+                if txn.product.current_stock >= txn.quantity:
+                    txn.product.current_stock -= txn.quantity
+                else:
+                    txn.product.current_stock = 0
+        
+        log = ActivityLog(
+            user_id=g.current_user.id if hasattr(g, 'current_user') else None, 
+            action=f"Auto-deleted Txn #{txn.id} (Contractor removed)", 
+            transaction_id=txn.id
+        )
+        db.session.add(log)
+
     try: 
         db.session.commit()
-        return jsonify({"message": "Contractor successfully removed"}), 200
-    
+        return jsonify({"message": "Contractor and associated transactions successfully removed"}), 200
     except Exception as e: 
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    
+
+
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
 def get_contractor_stock(id):
@@ -2305,7 +2306,8 @@ def recalibrate_stock():
             # Optional: Log the recalibration activity
             log = ActivityLog(
                 user_id=g.current_user.id,
-                action=f"Recalibrated Product #{product.id}): Stock forced to {expected_stock}"
+                # 👇 Shortened the text to stay safely under 50 characters
+                action=f"Fixed Prod #{product.id} stock to {expected_stock}" 
             )
             db.session.add(log)
             
