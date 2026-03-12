@@ -2127,6 +2127,7 @@ def get_contractor_stock(id):
 #     except Exception as e:
 #         print(f"Error: {e}")
 #         return jsonify({"error": "Failed to fetch supplier data"}), 500
+
 @core.route("/suppliers/<int:id>/products", methods=["GET"])
 @jwt_required
 def get_supplier_products(id): 
@@ -2152,7 +2153,7 @@ def get_supplier_products(id):
             Product.id,
             Product.name,
             Product.product_code,
-            Product.current_stock, # 👈 1. ADD THIS TO SELECT
+            # Removed Product.current_stock from here
             func.sum(
                 db.case(
                     (func.lower(Transaction.type) == 'in', Transaction.quantity),
@@ -2166,8 +2167,8 @@ def get_supplier_products(id):
              Transaction.supplier_id == id,
              func.lower(Transaction.type).in_(['in', 'return'])
          )\
-         .group_by(Product.id, Product.name, Product.product_code, Product.current_stock)\
-         .all() # 👈 2. ADD TO GROUP BY
+         .group_by(Product.id, Product.name, Product.product_code)\
+         .all() # Removed Product.current_stock from group_by
 
         data = []
         for r in results:
@@ -2175,7 +2176,7 @@ def get_supplier_products(id):
                 "id": r.id,
                 "name": r.name,
                 "sku": r.product_code,
-                "current_stock": float(r.current_stock or 0), # 👈 3. ADD TO RESPONSE
+                # Removed current_stock from the response
                 "total_supplied": float(r.total_supplied or 0), 
                 "last_supplied": r.last_supplied.strftime('%Y-%m-%d') if r.last_supplied else "N/A"
             })
