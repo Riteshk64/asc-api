@@ -45,6 +45,10 @@ def stock_operation():
     sku = data.get('sku')
     product_name = data.get('productName')
     op_type = data.get('type')
+    notes = data.get('notes', '').strip()
+    challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
+
+    
     
     try:
         qty = float(data.get('qty', 0))
@@ -108,6 +112,10 @@ def stock_operation():
 
     # 👇 FIX 2: Ensure the transaction is logged under the Product's true department
     txn_dept_id = product.department_id
+
+    # 👇 STRICT BACKEND VALIDATION: Only Department 3 gets a Challan ID
+    if txn_dept_id != 3:
+        challan_id = None
 
     # ==========================================
     # 3. STOCK LOGIC (UNCHANGED)
@@ -184,9 +192,12 @@ def stock_operation():
         quantity=qty,
         supplier_id=supplier_id or data.get('supplier_id'),
         contractor_id=contractor_id or data.get('contractor_id'),
-        department_id=txn_dept_id, # 👈 CHANGED THIS LINE
+        department_id=txn_dept_id, 
         created_by=g.current_user.id,
-        is_active=True 
+        is_active=True,
+        # 👇 ADD THIS LINE to save it to the DB
+        notes=notes if notes else None, 
+        challan_id=challan_id
     )
 
     try:
@@ -770,7 +781,9 @@ def get_transactions():
             "qty": t.quantity,
             "entity": entity_display,
             "supplier_id": t.supplier_id,
-            "contractor_id": t.contractor_id
+            "contractor_id": t.contractor_id,
+            "notes": t.notes, 
+            "challan_id": t.challan_id
         })
 
     return jsonify(results), 200
@@ -2030,7 +2043,6 @@ def delete_contractor(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
 def get_contractor_stock(id):
@@ -2042,6 +2054,8 @@ def get_contractor_stock(id):
         Product.name,
         Product.product_code,
         Product.unit,
+        Product.department_id, 
+        Transaction.challan_id, # 👈 1. SELECT the specific challan_id
         func.sum(case(
             (Transaction.type == 'out', Transaction.quantity), 
             (Transaction.type == 'return', -Transaction.quantity),
@@ -2053,15 +2067,16 @@ def get_contractor_stock(id):
          Transaction.is_active == True
      )
 
-    # ✅ Apply date filters if provided
     if start_date and end_date:
         query = query.filter(
             func.date(Transaction.date) >= start_date, 
             func.date(Transaction.date) <= end_date
         )
 
-    results = query.group_by(Product.id, Product.name, Product.product_code, Product.unit)\
-     .having(func.sum(case(
+    # 👇 2. GROUP BY the challan_id as well so they split into separate rows!
+    results = query.group_by(
+        Product.id, Product.name, Product.product_code, Product.unit, Product.department_id, Transaction.challan_id
+    ).having(func.sum(case(
             (Transaction.type == 'out', Transaction.quantity),
             (Transaction.type == 'return', -Transaction.quantity),
             else_=0
@@ -2075,9 +2090,12 @@ def get_contractor_stock(id):
             "product_name": r.name,
             "sku": r.product_code,
             "unit": r.unit,
-            "qty": r.net_qty
+            "qty": r.net_qty,
+            "challan_id": r.challan_id,      # 👈 Exact Challan for this row
+            "department_id": r.department_id 
         })
     return jsonify(stock_list), 200
+
 
 # @core.route("/suppliers/<int:id>/products", methods=["GET"])
 # @jwt_required
@@ -2258,7 +2276,10 @@ def get_product_transactions(id):
             "entity": entity_name,
             "is_active": t.is_active,
             "supplier_id": t.supplier_id,
-            "contractor_id": t.contractor_id
+            "contractor_id": t.contractor_id,
+            "notes": t.notes,
+            "challan_id": t.challan_id
+
         })
 
     return jsonify({

@@ -30,4 +30,5 @@ class Product(db.Model):
             "category_name": self.category_rel.name if self.category_rel else "OTHER",
             "sub_category_id": self.sub_category_id,
             "sub_category_name": self.sub_category_rel.name if self.sub_category_rel else "GENERAL",
+            "department_id": self.department_id
         }

@@ -4,7 +4,8 @@ from datetime import datetime
 class Transaction(db.Model):
     __tablename__ = 'transactions'
     id = db.Column(db.Integer, primary_key=True)
-    
+    notes = db.Column(db.Text, nullable=True)
+    challan_id = db.Column(db.String(100), nullable=True)
     product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
     
@@ -44,5 +45,7 @@ class Transaction(db.Model):
             
             # --- NEW ADDITIONS FOR ROBUST FILTERING ---
             "contractor_id": self.contractor_id, 
-            "supplier_id": self.supplier_id
+            "supplier_id": self.supplier_id,
+            "notes": self.notes, 
+            "challan_id": self.challan_id
         }
