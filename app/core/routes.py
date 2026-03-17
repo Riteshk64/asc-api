@@ -226,6 +226,7 @@ def get_user_details(id):
 
     # is_admin=True ensures pay_type, base_pay, etc. are included in the dict
     return jsonify(user.to_dict(is_admin=True)), 200
+
 @core.route('/users/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only

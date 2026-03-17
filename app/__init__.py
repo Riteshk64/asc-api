@@ -23,7 +23,7 @@ def create_app():
     CORS(app, max_age=86400)
 
     # load models
-    import app.models
+    from . import models
 
     # register blueprints
     app.register_blueprint(auth)
