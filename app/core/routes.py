@@ -36,7 +36,6 @@ def get_active_department():
     # ✅ Workers always use their latest database-assigned department
     return g.current_user.department_id
 
-
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
 def stock_operation():
@@ -348,7 +347,6 @@ def calculate_monthly_payout():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-
 @core.route('/attendance/<int:log_id>', methods=['DELETE'])
 @jwt_required
 @admin_only
@@ -406,8 +404,9 @@ def get_user_attendance_history(id):
 #     ).all()
 
 #     return jsonify([p.to_dict() for p in products]), 200
+
 from sqlalchemy.orm import joinedload
-from sqlalchemy.orm import joinedload # 👈 Ensure this is imported at the top
+
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -418,10 +417,9 @@ def get_products():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
 
-    # ==========================================
-    # 1. BUILD THE ULTRA-FAST SUBQUERY
-    # ==========================================
-    # We tell SQL to do the math first, grouped ONLY by the product_id
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("limit", 50, type=int), 100)
+
     txn_query = db.session.query(
         Transaction.product_id,
         func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
@@ -430,7 +428,6 @@ def get_products():
                       (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
     ).filter(Transaction.is_active == True)
 
-    # Apply date filters to the math if the frontend asks for them
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
@@ -439,15 +436,9 @@ def get_products():
         except ValueError:
             pass
 
-    # Turn this query into a temporary SQL table
     txn_subq = txn_query.group_by(Transaction.product_id).subquery()
 
-    # ==========================================
-    # 2. MAIN QUERY (No Grouping Error!)
-    # ==========================================
-    # Because the math is already done in the subquery, the main query doesn't need GROUP BY.
-    # This allows joinedload() to fetch the Categories instantly without PostgreSQL complaining.
-    results = db.session.query(
+    pagination = db.session.query(
         Product,
         func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
         func.coalesce(txn_subq.c.t_out, 0).label('total_out')
@@ -457,21 +448,30 @@ def get_products():
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
     ).filter(
-        Product.department_id == active_dept, 
+        Product.department_id == active_dept,
         Product.is_active == True
-    ).all()
+    ).order_by(Product.id.desc())\
+     .paginate(page=page, per_page=per_page, error_out=False)
 
-    # ==========================================
-    # 3. FORMAT THE RESPONSE
-    # ==========================================
+    results = pagination.items
+
     data = []
     for p, t_in, t_out in results:
         p_dict = p.to_dict()
         p_dict['total_stock_in'] = float(t_in)
         p_dict['total_stock_out'] = float(t_out)
         data.append(p_dict)
-        
-    return jsonify(data), 200
+
+    return jsonify({
+        "data": data,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": pagination.total,
+            "pages": pagination.pages
+        }
+    }), 200
+
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
@@ -695,7 +695,6 @@ def approve_user():
         db.session.rollback()
         return jsonify({"error": "Database operation failed", "details": str(e)}), 500
 
-
 @core.route('/users', methods=['GET'])
 @jwt_required
 @admin_only
@@ -715,6 +714,7 @@ def get_users():
 
     # Pass is_admin=True so the frontend gets the payroll configuration data
     return jsonify([user.to_dict(is_admin=True) for user in users]), 200
+
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 @admin_only
@@ -723,11 +723,23 @@ def get_transactions():
     end_str = request.args.get('end_date')
     active_dept = get_active_department()
 
-    # 👇 ADD .options() HERE
-    query = Transaction.query.options(
-        joinedload(Transaction.product),
-        joinedload(Transaction.supplier),
-        joinedload(Transaction.contractor)
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("limit", 50, type=int), 100)
+
+    query = db.session.query(
+        Transaction.id,
+        Transaction.created_at,
+        Transaction.type,
+        Transaction.quantity,
+        Transaction.product_id,
+        Product.name.label("product_name"),
+        Product.product_code.label("sku"),
+        Supplier.name.label("supplier_name"),
+        Contractor.name.label("contractor_name"),
+        Transaction.supplier_id,
+        Transaction.contractor_id,
+        Transaction.notes,
+        Transaction.challan_id
     ).join(Product)\
      .outerjoin(Supplier)\
      .outerjoin(Contractor)\
@@ -741,7 +753,6 @@ def get_transactions():
     if active_dept:
         query = query.filter(Product.department_id == active_dept)
 
-    # Date Filters
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
@@ -751,24 +762,30 @@ def get_transactions():
         except ValueError:
             pass
 
-    # Execute and return full list (ordered newest first)
-    txns = query.order_by(desc(Transaction.created_at)).all()
+    pagination = query.order_by(
+        desc(Transaction.created_at),
+        desc(Transaction.id)
+    ).paginate(
+        page=page,
+        per_page=per_page,
+        error_out=False
+    )
+
+    txns = pagination.items
 
     results = []
     for t in txns:
         entity_display = ""
-        
+
         if t.type == 'in':
-            entity_display = f"From: {t.supplier.name}" if t.supplier else "Supplier"
+            entity_display = f"From: {t.supplier_name}" if t.supplier_name else "Supplier"
         elif t.type == 'out':
-            entity_display = f"To: {t.contractor.name}" if t.contractor else "Contractor"
+            entity_display = f"To: {t.contractor_name}" if t.contractor_name else "Contractor"
         elif t.type == 'return':
             if t.supplier_id:
-                # You are returning defective items TO the supplier (Inventory -)
-                entity_display = f"Returned to: {t.supplier.name}"
+                entity_display = f"Returned to: {t.supplier_name}"
             elif t.contractor_id:
-                # Contractor is returning items TO you (Inventory +)
-                entity_display = f"Returned by: {t.contractor.name}"
+                entity_display = f"Returned by: {t.contractor_name}"
             else:
                 entity_display = "Return"
 
@@ -777,17 +794,25 @@ def get_transactions():
             "date": t.created_at.strftime('%Y-%m-%d'),
             "type": t.type,
             "product_id": t.product_id,
-            "product": t.product.name if t.product else "N/A",
-            "sku": t.product.product_code if t.product else "",
+            "product": t.product_name or "N/A",
+            "sku": t.sku or "",
             "qty": t.quantity,
             "entity": entity_display,
             "supplier_id": t.supplier_id,
             "contractor_id": t.contractor_id,
-            "notes": t.notes, 
+            "notes": t.notes,
             "challan_id": t.challan_id
         })
 
-    return jsonify(results), 200
+    return jsonify({
+        "data": results,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": pagination.total,
+            "pages": pagination.pages
+        }
+    }), 200
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
@@ -912,8 +937,6 @@ def get_recycle_bin():
         "sub_categories": [s.to_dict() for s in sub_categories] # 👈
     }), 200
     
-    
-
 @core.route('/recycle-bin/<string:type>/<int:id>/restore', methods=['PUT'])
 @jwt_required
 @admin_only
@@ -1051,7 +1074,6 @@ def restore_any_entity(type, id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -1211,8 +1233,6 @@ def get_departments():
     depts = Department.query.filter_by(is_active=True).all()
     return jsonify([d.to_dict() for d in depts]), 200
 
-
-
 @core.route('/employees', methods=['POST'])
 @jwt_required
 @admin_only
@@ -1259,7 +1279,6 @@ def add_employee():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 @core.route('/employees/<int:id>', methods=['PUT'])
 @jwt_required
@@ -1308,7 +1327,6 @@ def update_employee(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
     
-
 @core.route('/departments/<int:id>', methods=['GET'])
 @jwt_required
 def get_departments_by_id(id): 
@@ -1367,6 +1385,7 @@ def update_department(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500  
+
 @core.route('/suppliers', methods=['POST'])
 @jwt_required
 def add_supplier():
@@ -1509,7 +1528,6 @@ def update_supplier(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-
 @core.route('/contractors/<int:id>', methods=['PUT'])
 @jwt_required
 def update_contractor(id):
@@ -1643,7 +1661,6 @@ def swap_categories():
         
     return jsonify({"error": "Items not found"}), 404
 
-
 @core.route('/categories/<int:category_id>/sub-categories/swap', methods=['PUT'])
 @jwt_required
 def swap_contextual_sub_categories(category_id):
@@ -1698,7 +1715,6 @@ def add_category():
     db.session.commit()
     return jsonify({"message": "Category added successfully", "id": new_cat.id}), 201
 
-
 @core.route('/categories/<int:cat_id>', methods=['DELETE'])
 @jwt_required
 def delete_category(cat_id):
@@ -1719,13 +1735,13 @@ def delete_category(cat_id):
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
     
-
 @core.route('/sub-categories', methods=['GET'])
 @jwt_required
 def get_sub_categories():
     subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
     # We include display_order so the frontend knows how to sort them globally
     return jsonify([{"id": s.id, "name": s.name, "display_order": s.display_order} for s in subs]), 200
+
 @core.route('/sub-categories', methods=['POST'])
 @jwt_required
 def add_sub_category():
@@ -1762,6 +1778,7 @@ def delete_sub_category(sub_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
+
 # @core.route('/products', methods=['POST'])
 # @jwt_required
 # def add_product():
@@ -1864,7 +1881,6 @@ def delete_sub_category(sub_id):
     
 #     return jsonify({"message": "Product added successfully"}), 201
 
-
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
@@ -1885,7 +1901,7 @@ def add_product():
         return jsonify({"error": "Product SKU is required."}), 400
     sku = str(sku).strip()
 
-    # 🛑 VALIDATE NUMBERS (No Negatives!)
+    # VALIDATE NUMBERS (No Negatives!)
     try:
         qty = float(data.get('qty', 0))
         min_stock = float(data.get('min_stock', 10))
@@ -1897,8 +1913,6 @@ def add_product():
         return jsonify({"error": "Invalid numeric values provided."}), 400
 
     try:
-        
-
         cat_name = data.get('category_name', 'OTHER').strip().upper()
         category = Category.query.filter_by(name=cat_name).first()
         if not category:
@@ -1956,7 +1970,6 @@ def delete_product(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
     
-
 @core.route('/suppliers/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
@@ -2096,7 +2109,6 @@ def get_contractor_stock(id):
             "department_id": r.department_id 
         })
     return jsonify(stock_list), 200
-
 
 # @core.route("/suppliers/<int:id>/products", methods=["GET"])
 # @jwt_required
@@ -2293,7 +2305,6 @@ def get_product_transactions(id):
         }
     }), 200
     
-
 @core.route('/stock/recalibrate', methods=['POST'])
 @jwt_required
 def recalibrate_stock():
