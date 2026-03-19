@@ -1,17 +1,15 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask import Blueprint, request, jsonify, g
+from app.auth.jwt_middleware import jwt_required
 from datetime import datetime
 from app.extensions import db
 from app.models import User, Attendance
 
-
 attendance = Blueprint('attendance', __name__, url_prefix='/attendance')
 
 @attendance.route('/log', methods=['POST'])
-@jwt_required()
+@jwt_required
 def log_attendance():
-    admin_id = get_jwt_identity()
-    admin = User.query.get(admin_id)
+    admin = g.current_user
 
     # 1. SECURITY: Only Admins can log attendance
     if not admin or admin.role.upper() != 'ADMIN':
