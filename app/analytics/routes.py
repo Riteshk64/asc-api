@@ -1,4 +1,4 @@
-from flask import request, jsonify, g
+from flask import request, jsonify, g, Blueprint
 from sqlalchemy import func, case
 from app.auth.jwt_middleware import jwt_required
 from app.common.decorators import admin_only
@@ -6,10 +6,9 @@ from app.models.product import Product
 from app.models.transaction import Transaction
 from datetime import datetime
 from app.extensions import db
-
-# Import your new logic modules
 from .reports import inventory, movement, partners
-from . import analytics_bp
+
+analytics_bp = Blueprint('analytics', __name__, url_prefix='/analytics')
 
 # Helper to build filters based on request
 def build_filters():
