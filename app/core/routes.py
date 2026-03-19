@@ -36,19 +36,18 @@ def get_active_department():
     # ✅ Workers always use their latest database-assigned department
     return g.current_user.department_id
 
+
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
 def stock_operation():
     data = request.get_json()
-    product_id = data.get('product_id') # 👈 NEW: Get specific ID
+    product_id = data.get('product_id')
     sku = data.get('sku')
     product_name = data.get('productName')
     op_type = data.get('type')
     notes = data.get('notes', '').strip()
     challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
 
-    
-    
     try:
         qty = float(data.get('qty', 0))
         if qty <= 0: raise ValueError
@@ -59,79 +58,39 @@ def stock_operation():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    # ==========================================
-    # 1. SMART PRODUCT LOOKUP
-    # ==========================================
     product = None
-
-    # A. If we have an ID, use it (Most Reliable)
     if product_id:
         product = Product.query.get(product_id)
-    
-    # B. Fallback: Lookup by Name AND SKU (Since SKU alone isn't unique)
     if not product and sku and product_name:
-        product = Product.query.filter_by(
-            product_code=sku, 
-            name=product_name, 
-            department_id=active_dept
-        ).first()
-
-    # C. Final Fallback: SKU only (Only if we still haven't found it)
+        product = Product.query.filter_by(product_code=sku, name=product_name, department_id=active_dept).first()
     if not product and sku:
-        product = Product.query.filter_by(
-            product_code=sku, 
-            department_id=active_dept
-        ).first()
+        product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
 
-    # ==========================================
-    # 2. CREATE NEW PRODUCT (Only on 'in')
-    # ==========================================
     if not product:
-        if op_type != 'in':
-            return jsonify({"error": "Product not found"}), 404
-
-        if not product_name:
-            return jsonify({"error": "Product Name required for new products"}), 400
+        if op_type != 'in': return jsonify({"error": "Product not found"}), 404
+        if not product_name: return jsonify({"error": "Product Name required for new products"}), 400
 
         product = Product(
-            name=product_name,
-            product_code=sku,
-            unit=data.get('unit', 'pcs'),
-            # category=data.get('category', 'General'),
-            current_stock=0.0,
-            department_id=active_dept,
-            is_active=True
+            name=product_name, product_code=sku, unit=data.get('unit', 'pcs'),
+            current_stock=0.0, department_id=active_dept, is_active=True
         )
         db.session.add(product)
         db.session.flush()
 
-    # Security check
     if product.department_id != active_dept and g.role != 'ADMIN':
         return jsonify({"error": "Cross-department operation blocked"}), 403
 
-    # 👇 FIX 2: Ensure the transaction is logged under the Product's true department
     txn_dept_id = product.department_id
-
-    # 👇 STRICT BACKEND VALIDATION: Only Department 3 gets a Challan ID
-    if txn_dept_id != 3:
-        challan_id = None
-
-    # ==========================================
-    # 3. STOCK LOGIC (UNCHANGED)
-    # ==========================================
     supplier_id = data.get('supplier_id')
     contractor_id = data.get('contractor_id')
 
     if op_type == 'in':
         sup_name = data.get('supplier_name', '').strip()
-        if not sup_name and not supplier_id:
-            return jsonify({"error": "Supplier Name is strictly required to add stock."}), 400
-            
+        if not sup_name and not supplier_id: return jsonify({"error": "Supplier Name required."}), 400
         product.current_stock += qty
-        
         if not supplier_id:
             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-            if not supplier: # 👇 Now nested correctly inside 'if not supplier_id'
+            if not supplier:
                 supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
                 db.session.add(supplier)
                 db.session.flush()
@@ -139,16 +98,12 @@ def stock_operation():
         
     elif op_type == 'out':
         cont_name = data.get('contractor_name', '').strip()
-        if not cont_name and not contractor_id:
-            return jsonify({"error": "Contractor Name is strictly required to issue stock."}), 400
-            
-        if product.current_stock < qty:
-            return jsonify({"error": f"Insufficient stock ({product.current_stock})"}), 400
+        if not cont_name and not contractor_id: return jsonify({"error": "Contractor Name required."}), 400
+        # 👇 ALLOW NEGATIVE STOCK (Gatekeeper Removed)
         product.current_stock -= qty
-        
         if not contractor_id:
             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-            if not contractor: # 👇 Now nested correctly inside 'if not contractor_id'
+            if not contractor:
                 contractor = Contractor(name=cont_name, is_active=True)
                 db.session.add(contractor)
                 db.session.flush()
@@ -157,46 +112,35 @@ def stock_operation():
     elif op_type == 'return':
         sup_name = data.get('supplier_name', '').strip()
         cont_name = data.get('contractor_name', '').strip()
-
         if not sup_name and not cont_name and not supplier_id and not contractor_id:
-             return jsonify({"error": "A Supplier or Contractor is strictly required to process a return."}), 400
+             return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
         
         if sup_name or supplier_id:
-            if product.current_stock < qty:
-                return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
+            # 👇 ALLOW NEGATIVE STOCK (Gatekeeper Removed)
             product.current_stock -= qty
-            
             if not supplier_id:
                 supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
-                if not supplier: # 👇 Nested correctly
+                if not supplier:
                     supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
                     db.session.add(supplier)
                     db.session.flush()
                 supplier_id = supplier.id
-
         elif cont_name or contractor_id:
             product.current_stock += qty  
             if not contractor_id:
                 contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
-                if not contractor: # 👇 Nested correctly
+                if not contractor:
                     contractor = Contractor(name=cont_name, is_active=True)
                     db.session.add(contractor)
                     db.session.flush()
                 contractor_id = contractor.id
 
-    # Create Transaction using the correct product.id
     txn = Transaction(
-        product_id=product.id, 
-        type=op_type, 
-        quantity=qty,
+        product_id=product.id, type=op_type, quantity=qty,
         supplier_id=supplier_id or data.get('supplier_id'),
         contractor_id=contractor_id or data.get('contractor_id'),
-        department_id=txn_dept_id, 
-        created_by=g.current_user.id,
-        is_active=True,
-        # 👇 ADD THIS LINE to save it to the DB
-        notes=notes if notes else None, 
-        challan_id=challan_id
+        department_id=txn_dept_id, created_by=g.current_user.id, is_active=True,
+        notes=notes if notes else None, challan_id=challan_id
     )
 
     try:
@@ -207,6 +151,284 @@ def stock_operation():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+
+@core.route('/stock/operate/bulk', methods=['POST'])
+@jwt_required
+def bulk_stock_operation():
+    data = request.get_json()
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
+    items = data.get('items', [])
+    if not items:
+        return jsonify({"error": "No items provided."}), 400
+
+    op_type = data.get('type')
+    supplier_name = data.get('supplier_name', '').strip()
+    contractor_name = data.get('contractor_name', '').strip()
+    challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
+    date_str = data.get('date', '').strip()
+    notes = data.get('notes', '').strip()
+
+    op_date = datetime.utcnow()
+    if date_str:
+        try:
+            parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
+            op_date = datetime.combine(parsed_date.date(), datetime.utcnow().time())
+        except ValueError: pass 
+
+    supplier_id = None
+    contractor_id = None
+
+    if op_type == 'in':
+        if not supplier_name: return jsonify({"error": "Supplier Name is required for Stock In."}), 400
+        supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
+        if not supplier:
+            supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
+            db.session.add(supplier)
+            db.session.flush()
+        supplier_id = supplier.id
+
+    elif op_type == 'out':
+        if not contractor_name: return jsonify({"error": "Contractor Name is required for Stock Out."}), 400
+        contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
+        if not contractor:
+            contractor = Contractor(name=contractor_name, is_active=True)
+            db.session.add(contractor)
+            db.session.flush()
+        contractor_id = contractor.id
+
+    elif op_type == 'return':
+        if not supplier_name and not contractor_name:
+            return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
+        if supplier_name:
+            supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
+            if not supplier:
+                supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
+                db.session.add(supplier)
+                db.session.flush()
+            supplier_id = supplier.id
+        elif contractor_name:
+            contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
+            if not contractor:
+                contractor = Contractor(name=contractor_name, is_active=True)
+                db.session.add(contractor)
+                db.session.flush()
+            contractor_id = contractor.id
+
+    try:
+        for item in items:
+            prod_id = item.get('product_id')
+            qty = float(item.get('qty', 0))
+            if qty <= 0: continue
+
+            product = Product.query.get(prod_id)
+            if not product or (product.department_id != active_dept and g.role != 'ADMIN'):
+                raise Exception(f"Invalid or unauthorized product ID: {prod_id}")
+
+            # 👇 ALLOW NEGATIVE STOCK (Gatekeepers Removed)
+            if op_type == 'in':
+                product.current_stock += qty
+            elif op_type == 'out':
+                product.current_stock -= qty
+            elif op_type == 'return':
+                if supplier_name:
+                    product.current_stock -= qty
+                elif contractor_name:
+                    product.current_stock += qty
+
+            txn = Transaction(
+                product_id=product.id, type=op_type, quantity=qty,
+                supplier_id=supplier_id, contractor_id=contractor_id, department_id=product.department_id,
+                created_by=g.current_user.id, is_active=True,
+                notes=notes if notes else None, challan_id=challan_id,
+                created_at=op_date 
+            )
+            db.session.add(txn)
+            db.session.add(product)
+
+        db.session.commit()
+        return jsonify({"message": "Bulk stock operation successful"}), 200
+
+    except Exception as e:
+        db.session.rollback() 
+        return jsonify({"error": str(e)}), 400
+
+
+# @core.route('/stock/operate', methods=['POST'])
+# @jwt_required
+# def stock_operation():
+#     data = request.get_json()
+#     product_id = data.get('product_id') # 👈 NEW: Get specific ID
+#     sku = data.get('sku')
+#     product_name = data.get('productName')
+#     op_type = data.get('type')
+#     notes = data.get('notes', '').strip()
+#     challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
+
+    
+    
+#     try:
+#         qty = float(data.get('qty', 0))
+#         if qty <= 0: raise ValueError
+#     except ValueError:
+#         return jsonify({"error": "Invalid positive quantity required"}), 400
+
+#     active_dept = get_active_department()
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+
+#     # ==========================================
+#     # 1. SMART PRODUCT LOOKUP
+#     # ==========================================
+#     product = None
+
+#     # A. If we have an ID, use it (Most Reliable)
+#     if product_id:
+#         product = Product.query.get(product_id)
+    
+#     # B. Fallback: Lookup by Name AND SKU (Since SKU alone isn't unique)
+#     if not product and sku and product_name:
+#         product = Product.query.filter_by(
+#             product_code=sku, 
+#             name=product_name, 
+#             department_id=active_dept
+#         ).first()
+
+#     # C. Final Fallback: SKU only (Only if we still haven't found it)
+#     if not product and sku:
+#         product = Product.query.filter_by(
+#             product_code=sku, 
+#             department_id=active_dept
+#         ).first()
+
+#     # ==========================================
+#     # 2. CREATE NEW PRODUCT (Only on 'in')
+#     # ==========================================
+#     if not product:
+#         if op_type != 'in':
+#             return jsonify({"error": "Product not found"}), 404
+
+#         if not product_name:
+#             return jsonify({"error": "Product Name required for new products"}), 400
+
+#         product = Product(
+#             name=product_name,
+#             product_code=sku,
+#             unit=data.get('unit', 'pcs'),
+#             # category=data.get('category', 'General'),
+#             current_stock=0.0,
+#             department_id=active_dept,
+#             is_active=True
+#         )
+#         db.session.add(product)
+#         db.session.flush()
+
+#     # Security check
+#     if product.department_id != active_dept and g.role != 'ADMIN':
+#         return jsonify({"error": "Cross-department operation blocked"}), 403
+
+#     # 👇 FIX 2: Ensure the transaction is logged under the Product's true department
+#     txn_dept_id = product.department_id
+
+#     # 👇 STRICT BACKEND VALIDATION: Only Department 3 gets a Challan ID
+#     if txn_dept_id != 3:
+#         challan_id = None
+
+#     # ==========================================
+#     # 3. STOCK LOGIC (UNCHANGED)
+#     # ==========================================
+#     supplier_id = data.get('supplier_id')
+#     contractor_id = data.get('contractor_id')
+
+#     if op_type == 'in':
+#         sup_name = data.get('supplier_name', '').strip()
+#         if not sup_name and not supplier_id:
+#             return jsonify({"error": "Supplier Name is strictly required to add stock."}), 400
+            
+#         product.current_stock += qty
+        
+#         if not supplier_id:
+#             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+#             if not supplier: # 👇 Now nested correctly inside 'if not supplier_id'
+#                 supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+#                 db.session.add(supplier)
+#                 db.session.flush()
+#             supplier_id = supplier.id
+        
+#     elif op_type == 'out':
+#         cont_name = data.get('contractor_name', '').strip()
+#         if not cont_name and not contractor_id:
+#             return jsonify({"error": "Contractor Name is strictly required to issue stock."}), 400
+            
+#         if product.current_stock < qty:
+#             return jsonify({"error": f"Insufficient stock ({product.current_stock})"}), 400
+#         product.current_stock -= qty
+        
+#         if not contractor_id:
+#             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+#             if not contractor: # 👇 Now nested correctly inside 'if not contractor_id'
+#                 contractor = Contractor(name=cont_name, is_active=True)
+#                 db.session.add(contractor)
+#                 db.session.flush()
+#             contractor_id = contractor.id
+
+#     elif op_type == 'return':
+#         sup_name = data.get('supplier_name', '').strip()
+#         cont_name = data.get('contractor_name', '').strip()
+
+#         if not sup_name and not cont_name and not supplier_id and not contractor_id:
+#              return jsonify({"error": "A Supplier or Contractor is strictly required to process a return."}), 400
+        
+#         if sup_name or supplier_id:
+#             if product.current_stock < qty:
+#                 return jsonify({"error": f"Insufficient stock to return. Current: {product.current_stock}"}), 400
+#             product.current_stock -= qty
+            
+#             if not supplier_id:
+#                 supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+#                 if not supplier: # 👇 Nested correctly
+#                     supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+#                     db.session.add(supplier)
+#                     db.session.flush()
+#                 supplier_id = supplier.id
+
+#         elif cont_name or contractor_id:
+#             product.current_stock += qty  
+#             if not contractor_id:
+#                 contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+#                 if not contractor: # 👇 Nested correctly
+#                     contractor = Contractor(name=cont_name, is_active=True)
+#                     db.session.add(contractor)
+#                     db.session.flush()
+#                 contractor_id = contractor.id
+
+#     # Create Transaction using the correct product.id
+#     txn = Transaction(
+#         product_id=product.id, 
+#         type=op_type, 
+#         quantity=qty,
+#         supplier_id=supplier_id or data.get('supplier_id'),
+#         contractor_id=contractor_id or data.get('contractor_id'),
+#         department_id=txn_dept_id, 
+#         created_by=g.current_user.id,
+#         is_active=True,
+#         # 👇 ADD THIS LINE to save it to the DB
+#         notes=notes if notes else None, 
+#         challan_id=challan_id
+#     )
+
+#     try:
+#         db.session.add(txn)
+#         db.session.add(product) 
+#         db.session.commit()
+#         return jsonify({"message": "Stock updated", "new_qty": product.current_stock}), 200
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"error": str(e)}), 500
     
 @core.route('/users/<int:id>', methods=['GET'])
 @jwt_required
@@ -416,6 +638,12 @@ def get_products():
 
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    # 👇 1. Grab the search term from the query params
+    search_term = request.args.get('search', '').strip()
+    cat_ids = request.args.get('cats', '')
+    sub_ids = request.args.get('subs', '')
+
+    
 
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
@@ -438,7 +666,8 @@ def get_products():
 
     txn_subq = txn_query.group_by(Transaction.product_id).subquery()
 
-    pagination = db.session.query(
+    # 👇 2. Define the base query without pagination yet
+    base_query = db.session.query(
         Product,
         func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
         func.coalesce(txn_subq.c.t_out, 0).label('total_out')
@@ -450,7 +679,27 @@ def get_products():
     ).filter(
         Product.department_id == active_dept,
         Product.is_active == True
-    ).order_by(Product.id.desc())\
+    )
+
+    if search_term:
+        base_query = base_query.filter(
+            or_(
+                Product.name.ilike(f"%{search_term}%"),
+                Product.product_code.ilike(f"%{search_term}%")
+            )
+        )
+
+    # 👇 2. Apply the Checkbox Filters BEFORE paginating
+    if cat_ids:
+        cat_list = [int(x) for x in cat_ids.split(',')]
+        base_query = base_query.filter(Product.category_id.in_(cat_list))
+
+    if sub_ids:
+        sub_list = [int(x) for x in sub_ids.split(',')]
+        base_query = base_query.filter(Product.sub_category_id.in_(sub_list))
+
+    # 👇 3. Finally, paginate the filtered results
+    pagination = base_query.order_by(Product.id.desc())\
      .paginate(page=page, per_page=per_page, error_out=False)
 
     results = pagination.items
@@ -471,6 +720,7 @@ def get_products():
             "pages": pagination.pages
         }
     }), 200
+
 
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
@@ -721,87 +971,62 @@ def get_users():
 def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    search_term = request.args.get('search', '').strip()
     active_dept = get_active_department()
 
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
+    # 1. Filter the raw transactions by date FIRST
+    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
+    
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError:
+            pass
+
+    txn_subq = base_txn.subquery()
+
+    # 2. Group by Product and do the exact math your frontend used to do
     query = db.session.query(
-        Transaction.id,
-        Transaction.created_at,
-        Transaction.type,
-        Transaction.quantity,
-        Transaction.product_id,
-        Product.name.label("product_name"),
-        Product.product_code.label("sku"),
-        Supplier.name.label("supplier_name"),
-        Contractor.name.label("contractor_name"),
-        Transaction.supplier_id,
-        Transaction.contractor_id,
-        Transaction.notes,
-        Transaction.challan_id
-    ).join(Product)\
-     .outerjoin(Supplier)\
-     .outerjoin(Contractor)\
-     .filter(
-        Transaction.is_active == True,
-        Product.is_active == True,
-        or_(Supplier.id == None, Supplier.is_active == True),
-        or_(Contractor.id == None, Contractor.is_active == True)
-    )
+        Product.id.label('product_id'),
+        Product.name.label('product_name'),
+        Product.product_code.label('sku'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
+    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
 
     if active_dept:
         query = query.filter(Product.department_id == active_dept)
 
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d')
-            end_date = end_date.replace(hour=23, minute=59, second=59)
-            query = query.filter(Transaction.created_at.between(start_date, end_date))
-        except ValueError:
-            pass
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
 
-    pagination = query.order_by(
-        desc(Transaction.created_at),
-        desc(Transaction.id)
-    ).paginate(
-        page=page,
-        per_page=per_page,
-        error_out=False
-    )
+    query = query.group_by(Product.id, Product.name, Product.product_code)
 
-    txns = pagination.items
+    # 3. Paginate the grouped results
+    pagination = query.order_by(Product.name.asc()).paginate(page=page, per_page=per_page, error_out=False)
 
     results = []
-    for t in txns:
-        entity_display = ""
-
-        if t.type == 'in':
-            entity_display = f"From: {t.supplier_name}" if t.supplier_name else "Supplier"
-        elif t.type == 'out':
-            entity_display = f"To: {t.contractor_name}" if t.contractor_name else "Contractor"
-        elif t.type == 'return':
-            if t.supplier_id:
-                entity_display = f"Returned to: {t.supplier_name}"
-            elif t.contractor_id:
-                entity_display = f"Returned by: {t.contractor_name}"
-            else:
-                entity_display = "Return"
-
+    for r in pagination.items:
         results.append({
-            "id": t.id,
-            "date": t.created_at.strftime('%Y-%m-%d'),
-            "type": t.type,
-            "product_id": t.product_id,
-            "product": t.product_name or "N/A",
-            "sku": t.sku or "",
-            "qty": t.quantity,
-            "entity": entity_display,
-            "supplier_id": t.supplier_id,
-            "contractor_id": t.contractor_id,
-            "notes": t.notes,
-            "challan_id": t.challan_id
+            "product_id": r.product_id,
+            "product": r.product_name,
+            "sku": r.sku,
+            "total_in": float(r.total_in),
+            "total_out": float(r.total_out),
+            "return_in": float(r.return_in),
+            "return_out": float(r.return_out)
         })
 
     return jsonify({
@@ -814,19 +1039,406 @@ def get_transactions():
         }
     }), 200
 
+
+from flask import Response
+from weasyprint import HTML
+from sqlalchemy import func, case, and_, or_
+from sqlalchemy.orm import joinedload
+
+@core.route('/products/export/pdf', methods=['GET'])
+@jwt_required
+def export_products_pdf():
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
+    # 1. Grab filters
+    search_term = request.args.get('search', '').strip()
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+
+    # 2. Build the exact same Transaction Subquery to get accurate In/Out numbers
+    txn_query = db.session.query(
+        Transaction.product_id,
+        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
+        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
+    ).filter(Transaction.is_active == True)
+
+    is_custom_range = False
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+            is_custom_range = True
+        except ValueError:
+            pass
+
+    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
+
+    # 3. Build Base Query
+    query = db.session.query(
+        Product,
+        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
+        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
+    ).outerjoin(
+        txn_subq, Product.id == txn_subq.c.product_id
+    ).options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
+    ).filter(
+        Product.department_id == active_dept,
+        Product.is_active == True
+    )
+
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+
+    # Fetch EVERYTHING matching the filters (No pagination)
+    # Fetch EVERYTHING matching the filters (No pagination)
+    results = query.all()
+
+    # ==========================================
+    # 4. Group the Data & Track Display Orders
+    # ==========================================
+    groups = {}
+    cat_orders = {}
+    sub_orders = {}
+
+    for p, t_in, t_out in results:
+        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
+        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
+
+        # Safely extract the database display_order (fallback to 9999 for nulls/others)
+        cat_orders[cat_name] = p.category_rel.display_order if p.category_rel else 9999
+        sub_orders[sub_name] = p.sub_category_rel.display_order if p.sub_category_rel else 9999
+
+        if cat_name not in groups:
+            groups[cat_name] = {}
+        if sub_name not in groups[cat_name]:
+            groups[cat_name][sub_name] = []
+
+        # Calculate exact stock based on active range
+        current_stock = (t_in - t_out) if is_custom_range else p.current_stock
+
+        groups[cat_name][sub_name].append({
+            "code": p.product_code or '-',
+            "name": p.name or '-',
+            "in": int(t_in),
+            "out": int(t_out),
+            "stock": int(current_stock)
+        })
+
+    # ==========================================
+    # 5. Build HTML String with Strict Sorting
+    # ==========================================
+    rows_html = ""
+    
+    # 1st Sort: Categories by display_order, then tie-break alphabetically
+    sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
+    
+    for cat_name in sorted_cats:
+        rows_html += f'<tr><td colspan="5" style="background-color:#1e293b; color:#fff; font-weight:bold; text-align:center; padding:10px;">{cat_name} Category</td></tr>'
+        
+        # 2nd Sort: Sub-Categories by display_order, then tie-break alphabetically
+        sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders.get(s, 9999), s))
+        
+        for sub_name in sorted_subs:
+            rows_html += f'<tr><td colspan="5" style="background-color:#f1f5f9; font-weight:bold; padding:8px; font-size:10px; border-left:4px solid #3b82f6;">{sub_name}</td></tr>'
+            
+            # 3rd Sort: Items by Product Code
+            items = sorted(groups[cat_name][sub_name], key=lambda x: str(x['code']).upper())
+            for item in items:
+                rows_html += f"""
+                <tr>
+                  <td style="width: 20%; font-family: monospace;">{item['code']}</td>
+                  <td style="width: 45%;">{item['name']}</td>
+                  <td style="text-align: right;">{item['in']}</td>
+                  <td style="text-align: right;">{item['out']}</td>
+                  <td style="text-align: right; font-weight:bold;">{item['stock']}</td>
+                </tr>
+                """
+
+    date_text = f"{start_str} to {end_str}" if is_custom_range else "All Time"
+    
+    html_content = f"""
+      <html>
+        <head>
+          <style>
+            body {{ font-family: Helvetica, Arial, sans-serif; padding: 10px; color: #334155; }}
+            .header {{ text-align: center; border-bottom: 3px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+            th, td {{ border: 1px solid #e2e8f0; padding: 6px 8px; font-size: 9px; word-wrap: break-word; }}
+            th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; text-align: left; font-size: 10px; }}
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h2 style="margin:0; color:#1e40af;">Inventory Report</h2>
+            <p style="margin:5px 0; font-size:11px; color:#64748b;">Report Period: {date_text}</p>
+          </div>
+          <table>
+            <thead>
+              <tr><th style="width: 20%;">Code</th><th style="width: 45%;">Item Name</th><th style="width: 10%; text-align: right;">In</th><th style="width: 10%; text-align: right;">Out</th><th style="width: 15%; text-align: right;">Stock</th></tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </body>
+      </html>
+    """
+
+    # 6. Convert HTML to PDF and stream to frontend
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": "attachment;filename=inventory_report.pdf"}
+    )
+
+import csv
+import io
+from flask import Response
+
+@core.route('/products/export/csv', methods=['GET'])
+@jwt_required
+def export_products_csv():
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
+    # 1. Get exact same filters the frontend is currently viewing
+    search_term = request.args.get('search', '').strip()
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+    
+    # Optional: Get category filters if you pass them (e.g., ?cats=1,2,3)
+    cat_ids = request.args.get('cats', '') 
+    sub_ids = request.args.get('subs', '')
+
+    # 2. Build the exact same base query (I'm summarizing the joins for brevity, 
+    # use the same txn_subq logic you have in get_products)
+    query = db.session.query(Product).filter(
+        Product.department_id == active_dept,
+        Product.is_active == True
+    )
+
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+
+    if cat_ids:
+        cat_list = [int(x) for x in cat_ids.split(',')]
+        query = query.filter(Product.category_id.in_(cat_list))
+
+    # Fetch all matching products (Database handles this instantly)
+    products = query.order_by(Product.category_id, Product.sub_category_id).all()
+
+    # 3. Build the CSV in memory (No saving to disk required)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write Headers
+    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'Current Stock'])
+
+    # Write Data
+    for p in products:
+        writer.writerow([
+            p.category_rel.name if p.category_rel else 'OTHER',
+            p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
+            p.product_code,
+            p.name,
+            p.current_stock # Use your total_in / total_out logic here if needed
+        ])
+
+    # 4. Return as a downloadable file
+    output.seek(0)
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=inventory_report.csv"}
+
+
+    )
+
+
+import csv
+import io
+from flask import Response
+from weasyprint import HTML
+
+@core.route('/transactions/export/csv', methods=['GET'])
+@jwt_required
+def export_transactions_csv():
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+    search_term = request.args.get('search', '').strip()
+    active_dept = get_active_department()
+
+    # 1. Base transaction query (Same as your UI)
+    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError:
+            pass
+    txn_subq = base_txn.subquery()
+
+    # 2. Group by Product and sum (Same as your UI)
+    query = db.session.query(
+        Product.name.label('product_name'),
+        Product.product_code.label('sku'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
+    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
+
+    if active_dept:
+        query = query.filter(Product.department_id == active_dept)
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+
+    query = query.group_by(Product.id, Product.name, Product.product_code)
+    
+    # 3. Fetch ALL results (No pagination)
+    results = query.order_by(Product.name.asc()).all()
+
+    # 4. Generate CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Product Name', 'SKU', 'Total In', 'Returns In', 'Total Out', 'Returns Out'])
+
+    for r in results:
+        writer.writerow([
+            r.product_name, 
+            r.sku or '-', 
+            float(r.total_in), 
+            float(r.return_in), 
+            float(r.total_out), 
+            float(r.return_out)
+        ])
+
+    output.seek(0)
+    return Response(
+        output, 
+        mimetype="text/csv", 
+        headers={"Content-Disposition": "attachment;filename=Transaction_History.csv"}
+    )
+
+
+@core.route('/transactions/export/pdf', methods=['GET'])
+@jwt_required
+def export_transactions_pdf():
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+    search_term = request.args.get('search', '').strip()
+    active_dept = get_active_department()
+
+    # 1. Base transaction query
+    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError: pass
+    txn_subq = base_txn.subquery()
+
+    # 2. Group by Product and sum
+    query = db.session.query(
+        Product.name.label('product_name'),
+        Product.product_code.label('sku'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
+        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
+                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
+        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
+    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
+
+    if active_dept: query = query.filter(Product.department_id == active_dept)
+    if search_term: query = query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
+
+    query = query.group_by(Product.id, Product.name, Product.product_code)
+    results = query.order_by(Product.name.asc()).all()
+
+    # 3. Generate HTML rows mirroring the UI
+    rows_html = ""
+    for r in results:
+        in_text = f"{float(r.total_in)}"
+        if float(r.return_in) > 0: in_text += f" ({float(r.return_in)} R)"
+        
+        out_text = f"{float(r.total_out)}"
+        if float(r.return_out) > 0: out_text += f" ({float(r.return_out)} R)"
+
+        rows_html += f"""
+        <tr>
+            <td><strong>{r.product_name}</strong><br><span style="color:#64748b; font-size:10px;">{r.sku or '-'}</span></td>
+            <td style="color:#15803d; font-weight:bold;">IN: {in_text}</td>
+            <td style="color:#b91c1c; font-weight:bold;">OUT: {out_text}</td>
+        </tr>
+        """
+
+    range_header = f"{start_str} to {end_str}" if start_str and end_str else "All Time History"
+
+    html = f"""
+      <html>
+      <head>
+        <style>
+          body {{ font-family: sans-serif; padding: 20px; color: #334155; }}
+          .header-box {{ text-align: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 20px; margin-bottom: 20px; }}
+          h2 {{ color: #1e40af; margin: 0; text-transform: uppercase; }}
+          .date-range {{ font-size: 14px; color: #64748b; margin-top: 5px; font-weight: bold; }}
+          table {{ width: 100%; border-collapse: collapse; }}
+          th, td {{ border: 1px solid #e5e7eb; padding: 10px; font-size: 12px; }}
+          th {{ background-color: #f8fafc; color: #475569; text-transform: uppercase; text-align: left; }}
+        </style>
+      </head>
+      <body>
+        <div class="header-box">
+          <h2>Transaction Summary Report</h2>
+          <div class="date-range">Report Period: {range_header}</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 50%;">Product & SKU</th>
+              <th style="width: 25%;">Total In</th>
+              <th style="width: 25%;">Total Out</th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </body>
+      </html>
+    """
+    pdf_bytes = HTML(string=html).write_pdf()
+    return Response(pdf_bytes, mimetype="application/pdf", headers={"Content-Disposition": "attachment;filename=Transaction_History.pdf"})
+
+
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
 def update_transaction(id):
-    """
-    Update Transaction Quantity.
-    Automatically adjusts Product Stock based on the difference.
-    """
     txn = Transaction.query.get(id)
     if not txn:
         return jsonify({"error": "Transaction not found"}), 404
 
-    # Permission Check
     if g.role != 'ADMIN' and txn.product.department_id != g.department_id:
          return jsonify({"error": "Unauthorized"}), 403
 
@@ -844,28 +1456,14 @@ def update_transaction(id):
     if diff == 0:
         return jsonify({"message": "No change detected"}), 200
 
-    # === LOGIC: APPLY DELTA TO STOCK ===
-    
-    # CASE 1: STOCK IN (Supplier provided more or less)
+    # 👇 ALLOW NEGATIVE STOCK
     if txn.type == 'in' or txn.type == 'return':
-        # If we increased In quantity, Stock goes UP. 
-        # If we decreased In quantity, Stock goes DOWN.
-        if diff < 0 and product.current_stock < abs(diff):
-             return jsonify({"error": "Cannot reduce quantity: Stock would become negative"}), 400
         product.current_stock += diff
-
-    # CASE 2: STOCK OUT (Sent to Contractor)
     elif txn.type == 'out':
-        # If we increased Out quantity (sent more), Stock goes DOWN.
-        # If we decreased Out quantity (sent less), Stock goes UP.
-        if diff > 0 and product.current_stock < diff:
-             return jsonify({"error": "Cannot increase output: Not enough stock available"}), 400
         product.current_stock -= diff
 
-    # Update Transaction
     txn.quantity = new_qty
     
-    # Log Activity
     log = ActivityLog(
         user_id=g.current_user.id, 
         action=f"Updated Txn #{txn.id} Qty: {old_qty} -> {new_qty}", 
@@ -873,7 +1471,7 @@ def update_transaction(id):
     )
     
     db.session.add(log)
-    db.session.add(product) # Save Stock Change
+    db.session.add(product) 
     
     try:
         db.session.commit()
@@ -937,14 +1535,12 @@ def get_recycle_bin():
         "sub_categories": [s.to_dict() for s in sub_categories] # 👈
     }), 200
     
+
 @core.route('/recycle-bin/<string:type>/<int:id>/restore', methods=['PUT'])
 @jwt_required
 @admin_only
 def restore_any_entity(type, id):
     try:
-        # ====================================================
-        # 1. RESTORE SUPPLIER & CASCADE RESTORE TRANSACTIONS
-        # ====================================================
         if type == 'supplier':
             supplier = Supplier.query.get(id)
             if not supplier: return jsonify({"error": "Supplier not found"}), 404
@@ -952,17 +1548,14 @@ def restore_any_entity(type, id):
             supplier.is_active = True
             db.session.add(supplier)
             
-            # Find and restore all their deleted transactions
             txns = Transaction.query.filter_by(supplier_id=id, is_active=False).all()
             for txn in txns:
-                # Only adjust stock if the product wasn't permanently deleted
                 if txn.product and txn.product.is_active:
+                    # 👇 ALLOW NEGATIVE STOCK
                     if txn.type == 'in':
-                        txn.product.current_stock += txn.quantity # Put the stock back
+                        txn.product.current_stock += txn.quantity 
                     elif txn.type == 'return':
-                        if txn.product.current_stock < txn.quantity:
-                            return jsonify({"error": f"Cannot restore supplier: Not enough stock of '{txn.product.name}' to re-apply past returns."}), 400
-                        txn.product.current_stock -= txn.quantity # Take the returned stock out again
+                        txn.product.current_stock -= txn.quantity 
                 
                 txn.is_active = True
                 db.session.add(txn)
@@ -970,10 +1563,6 @@ def restore_any_entity(type, id):
             log = ActivityLog(user_id=g.current_user.id, action=f"Restored Supplier & Transactions: {supplier.name}"[:50])
             db.session.add(log)
 
-
-        # ====================================================
-        # 2. RESTORE CONTRACTOR & CASCADE RESTORE TRANSACTIONS
-        # ====================================================
         elif type == 'contractor':
             contractor = Contractor.query.get(id)
             if not contractor: return jsonify({"error": "Contractor not found"}), 404
@@ -981,16 +1570,14 @@ def restore_any_entity(type, id):
             contractor.is_active = True
             db.session.add(contractor)
             
-            # Find and restore all their deleted transactions
             txns = Transaction.query.filter_by(contractor_id=id, is_active=False).all()
             for txn in txns:
                 if txn.product and txn.product.is_active:
+                    # 👇 ALLOW NEGATIVE STOCK
                     if txn.type == 'out':
-                        if txn.product.current_stock < txn.quantity:
-                            return jsonify({"error": f"Cannot restore contractor: Not enough stock of '{txn.product.name}' to re-apply past outputs."}), 400
-                        txn.product.current_stock -= txn.quantity # Deduct the stock they took
+                        txn.product.current_stock -= txn.quantity 
                     elif txn.type == 'return':
-                        txn.product.current_stock += txn.quantity # Add the stock they returned back
+                        txn.product.current_stock += txn.quantity 
                 
                 txn.is_active = True
                 db.session.add(txn)
@@ -998,10 +1585,6 @@ def restore_any_entity(type, id):
             log = ActivityLog(user_id=g.current_user.id, action=f"Restored Contractor & Transactions: {contractor.name}"[:50])
             db.session.add(log)
 
-
-        # ====================================================
-        # 3. RESTORE PRODUCT
-        # ====================================================
         elif type == 'product':
             product = Product.query.get(id)
             if not product: return jsonify({"error": "Product not found"}), 404
@@ -1012,10 +1595,6 @@ def restore_any_entity(type, id):
             log = ActivityLog(user_id=g.current_user.id, action=f"Restored Product: {product.name}"[:50])
             db.session.add(log)
 
-
-        # ====================================================
-        # 4. RESTORE TRANSACTION (Complex Logic)
-        # ====================================================
         elif type == 'transaction':
             txn = Transaction.query.get(id)
             if not txn: return jsonify({"error": "Transaction not found"}), 404
@@ -1024,21 +1603,15 @@ def restore_any_entity(type, id):
             if not product or not product.is_active:
                 return jsonify({"error": "Cannot restore: Parent Product is deleted"}), 400
 
-            # === RE-APPLY STOCK LOGIC ===
+            # 👇 ALLOW NEGATIVE STOCK
             if txn.type == 'in':
                 product.current_stock += txn.quantity
             elif txn.type == 'out':
-                if product.current_stock < txn.quantity:
-                    return jsonify({"error": "Cannot restore: Not enough stock"}), 400
                 product.current_stock -= txn.quantity
             elif txn.type == 'return':
                 if txn.supplier_id:
-                    # It was a return TO supplier (Stock left) -> Must subtract again
-                    if product.current_stock < txn.quantity:
-                        return jsonify({"error": "Cannot restore supplier return: Stock would go negative"}), 400
                     product.current_stock -= txn.quantity
                 else:
-                    # It was a return FROM contractor (Stock arrived) -> Must add again
                     product.current_stock += txn.quantity
 
             txn.is_active = True
@@ -1067,7 +1640,6 @@ def restore_any_entity(type, id):
         else:
             return jsonify({"error": "Invalid entity type"}), 400
 
-        # Commit whatever happened above
         db.session.commit()
         return jsonify({"message": f"{type.replace('_', '-').title()} restored successfully"}), 200
         
@@ -1078,70 +1650,47 @@ def restore_any_entity(type, id):
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
 def delete_transaction(id):
-    """
-    Soft-deletes a transaction (moves to Recycle Bin) and accurately 
-    reverses its historical impact on the current product stock.
-    """
     txn = Transaction.query.get(id)
     if not txn: 
         return jsonify({"error": "Transaction not found"}), 404
 
-    # Permission Check: Only Admin or the Department that owns the product
     active_dept = get_active_department()
     if g.role != 'ADMIN' and txn.product.department_id != active_dept:
          return jsonify({"error": "Unauthorized to delete this transaction"}), 403
 
     product = txn.product
 
-    # ==========================================
-    # REVERSE STOCK IMPACT
-    # ==========================================
+    # 👇 ALLOW NEGATIVE STOCK
     if txn.type == 'in':
-        # It was originally added. So we must subtract it.
-        if product.current_stock < txn.quantity:
-             return jsonify({"error": "Cannot delete: Stock would become negative"}), 400
         product.current_stock -= txn.quantity
-        
     elif txn.type == 'out':
-        # It was originally subtracted. So we must add it back.
         product.current_stock += txn.quantity
-        
     elif txn.type == 'return':
         if txn.supplier_id:
-            # Return TO supplier (Stock originally went down). We must add it back.
             product.current_stock += txn.quantity
         else:
-            # Return FROM contractor (Stock originally went up). We must subtract it.
-            if product.current_stock < txn.quantity:
-                 return jsonify({"error": "Cannot delete return: Stock would become negative"}), 400
             product.current_stock -= txn.quantity
 
-    # 1. Soft Delete the transaction
     txn.is_active = False
 
-    # 2. Log the activity
     log = ActivityLog(
         user_id=g.current_user.id,
         action=f"Moved Txn #{txn.id} to Recycle Bin",
         transaction_id=txn.id
     )
     
-    # 3. Stage changes
     db.session.add(log)
     db.session.add(product)
 
-    # 4. Commit to database
     try:
         db.session.commit()
         return jsonify({
             "message": "Transaction moved to Recycle Bin", 
             "new_stock": product.current_stock
         }), 200
-        
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
-
 
 @core.route('/recycle-bin/<string:type>/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -1607,18 +2156,43 @@ def add_contractor():
 def get_categories():
     cats = Category.query.order_by(Category.display_order.asc(), Category.id.asc()).all()
     
+    # 👇 1. Scan the ENTIRE database for all unique Category + SubCategory pairs currently in use.
+    # This completely bypasses the 50-item pagination limit.
+    active_pairs = db.session.query(Product.category_id, Product.sub_category_id)\
+        .filter(Product.is_active == True)\
+        .distinct().all()
+        
+    # 👇 2. Group those pairs by category_id
+    used_subs_by_cat = {}
+    for cid, sid in active_pairs:
+        if cid not in used_subs_by_cat:
+            used_subs_by_cat[cid] = set()
+        if sid:
+            used_subs_by_cat[cid].add(str(sid))
+
     result = []
     for c in cats:
+        # 3. Get any manual sorting orders the user set via the Manage Order modal
         sub_orders_query = CategorySubOrder.query.filter_by(category_id=c.id).all()
         sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
+        
+        # 👇 4. THE MAGIC: Merge the database reality with the sorting dictionary.
+        # If a product links a sub-category to this category, guarantee it exists in the dictionary!
+        dynamic_subs = used_subs_by_cat.get(c.id, set())
+        for sid in dynamic_subs:
+            if sid not in sub_orders_dict:
+                sub_orders_dict[sid] = 999  # Give it a default display order at the bottom
         
         result.append({
             "id": c.id, 
             "name": c.name, 
             "display_order": c.display_order,
-            "sub_orders": sub_orders_dict
+            # Now contains EVERY sub-category, even if they are on Page 50!
+            "sub_orders": sub_orders_dict 
         })
+        
     return jsonify(result), 200
+
 
 @core.route('/categories/reorder', methods=['PUT'])
 @jwt_required
@@ -1697,7 +2271,6 @@ def swap_sub_categories():
         return jsonify({"message": "Items swapped successfully"}), 200
         
     return jsonify({"error": "Items not found"}), 404
-
 @core.route('/categories', methods=['POST'])
 @jwt_required
 def add_category():
@@ -1705,15 +2278,27 @@ def add_category():
     if not data or 'name' not in data:
         return jsonify({"error": "Category name is required"}), 400
         
+    # 1. Check if the frontend provided an explicit display_order
+    # If not (or if it's 0), we calculate the true next order.
+    provided_order = data.get('display_order', 0)
+    
+    if not provided_order or provided_order == 0:
+        # Find the highest existing display_order in the database
+        max_order = db.session.query(func.max(Category.display_order)).scalar()
+        # If the table is empty, start at 1. Otherwise, take max + 1.
+        next_order = (max_order or 0) + 1
+    else:
+        next_order = provided_order
+        
     new_cat = Category(
         name=data['name'], 
-        display_order=data.get('display_order', 0),
-        is_active=True  # 👈 Added this to support your new Recycle Bin logic
-        # 💥 Removed match_codes
+        display_order=next_order,
+        is_active=True 
     )
     db.session.add(new_cat)
     db.session.commit()
     return jsonify({"message": "Category added successfully", "id": new_cat.id}), 201
+
 
 @core.route('/categories/<int:cat_id>', methods=['DELETE'])
 @jwt_required
@@ -1749,15 +2334,40 @@ def add_sub_category():
     if not data or 'name' not in data:
         return jsonify({"error": "Sub-Category name is required"}), 400
         
+    provided_order = data.get('display_order', 0)
+    
+    if not provided_order or provided_order == 0:
+        # Find the highest existing display_order in the database
+        max_order = db.session.query(func.max(SubCategory.display_order)).scalar()
+        next_order = (max_order or 0) + 1
+    else:
+        next_order = provided_order
+        
     new_sub = SubCategory(
         name=data['name'], 
-        display_order=data.get('display_order', 0),
-        is_active=True  # 👈 Added this to support your new Recycle Bin logic
-        # 💥 Removed match_rule
+        display_order=next_order,
+        is_active=True 
     )
     db.session.add(new_sub)
     db.session.commit()
     return jsonify({"message": "Sub-Category added successfully", "id": new_sub.id}), 201
+
+@core.route('/fix-order-zeros', methods=['GET'])
+@jwt_required
+@admin_only
+def fix_order_zeros():
+    # 1. Fix Categories
+    cats = Category.query.order_by(Category.display_order.asc(), Category.id.asc()).all()
+    for index, cat in enumerate(cats):
+        cat.display_order = index + 1
+        
+    # 2. Fix Sub-Categories
+    subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.id.asc()).all()
+    for index, sub in enumerate(subs):
+        sub.display_order = index + 1
+        
+    db.session.commit()
+    return jsonify({"message": "All 0s have been replaced with sequential numbers!"}), 200
 
 @core.route('/sub-categories/<int:sub_id>', methods=['DELETE'])
 @jwt_required
@@ -2057,6 +2667,7 @@ def delete_contractor(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
 def get_contractor_stock(id):
@@ -2069,7 +2680,8 @@ def get_contractor_stock(id):
         Product.product_code,
         Product.unit,
         Product.department_id, 
-        Transaction.challan_id, # 👈 1. SELECT the specific challan_id
+        Transaction.challan_id,
+        func.max(Transaction.created_at).label('last_date'), # 👈 GET THE DATE
         func.sum(case(
             (Transaction.type == 'out', Transaction.quantity), 
             (Transaction.type == 'return', -Transaction.quantity),
@@ -2083,11 +2695,10 @@ def get_contractor_stock(id):
 
     if start_date and end_date:
         query = query.filter(
-            func.date(Transaction.date) >= start_date, 
-            func.date(Transaction.date) <= end_date
+            func.date(Transaction.created_at) >= start_date, # 👈 Fixed to created_at
+            func.date(Transaction.created_at) <= end_date
         )
 
-    # 👇 2. GROUP BY the challan_id as well so they split into separate rows!
     results = query.group_by(
         Product.id, Product.name, Product.product_code, Product.unit, Product.department_id, Transaction.challan_id
     ).having(func.sum(case(
@@ -2105,7 +2716,8 @@ def get_contractor_stock(id):
             "sku": r.product_code,
             "unit": r.unit,
             "qty": r.net_qty,
-            "challan_id": r.challan_id,      # 👈 Exact Challan for this row
+            "challan_id": r.challan_id,
+            "date": r.last_date.strftime('%Y-%m-%d') if r.last_date else "", # 👈 Send Date to frontend
             "department_id": r.department_id 
         })
     return jsonify(stock_list), 200
@@ -2218,24 +2830,21 @@ def get_supplier_products(id):
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @core.route('/products/<int:id>/transactions', methods=['GET'])
 @jwt_required
 def get_product_transactions(id):
-    # 1. Product Existence Check
     product = Product.query.get(id)
     if not product:
         return jsonify({"error": "Product not found"}), 404
 
-    # OPTIMIZED: Add pagination
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
-    # per_page = min(per_page, 1000000)  
-
-    # 2. Get Date Filters from Query Params
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    search_term = request.args.get('search', '').strip()
+    sort_order = request.args.get('sort', 'desc').strip().lower()
 
-    # 3. Build Base Query (Identical to get_transactions, but filtered by ID)
     query = Transaction.query.options(
         joinedload(Transaction.product),
         joinedload(Transaction.supplier),
@@ -2244,28 +2853,43 @@ def get_product_transactions(id):
      .outerjoin(Supplier)\
      .outerjoin(Contractor)\
      .filter(
-         Transaction.product_id == id, # 👈 Specific Product Filter
-            Transaction.is_active == True,
-            Product.is_active == True,
-            or_(Supplier.id == None, Supplier.is_active == True),
-            or_(Contractor.id == None, Contractor.is_active == True)
-        )
+         Transaction.product_id == id,
+         Transaction.is_active == True,
+         Product.is_active == True,
+         or_(Supplier.id == None, Supplier.is_active == True),
+         or_(Contractor.id == None, Contractor.is_active == True)
+     )
 
-    # 4. Apply Date Filters
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d')
-            # Ensure we cover the full end day
-            end_date = end_date.replace(hour=23, minute=59, second=59)
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
             query = query.filter(Transaction.created_at.between(start_date, end_date))
         except ValueError:
             pass
 
-    # 5. Execute with pagination
-    paginated = query.order_by(desc(Transaction.created_at)).paginate(page=page, per_page=per_page, error_out=False)
+    if search_term:
+        query = query.filter(or_(
+            Supplier.name.ilike(f"%{search_term}%"),
+            Contractor.name.ilike(f"%{search_term}%"),
+            Transaction.challan_id.ilike(f"%{search_term}%"),
+            Transaction.notes.ilike(f"%{search_term}%"),
+            db.cast(func.date(Transaction.created_at), db.String).ilike(f"%{search_term}%"),
+            # 👇 Allows searching for "Manual Adjustment" dynamically
+            and_(
+                Transaction.supplier_id == None, 
+                Transaction.contractor_id == None,
+                db.literal("Manual Adjustment").ilike(f"%{search_term}%")
+            )
+        ))
 
-    # 6. Format Results (Exact match to Global History)
+    if sort_order == 'asc':
+        query = query.order_by(Transaction.created_at.asc(), Transaction.id.asc())
+    else:
+        query = query.order_by(Transaction.created_at.desc(), Transaction.id.desc())
+
+    paginated = query.paginate(page=page, per_page=per_page, error_out=False)
+
     results = []
     for t in paginated.items:
         entity_name = "Manual Adjustment"
@@ -2292,19 +2916,12 @@ def get_product_transactions(id):
             "contractor_id": t.contractor_id,
             "notes": t.notes,
             "challan_id": t.challan_id
-
         })
 
     return jsonify({
         "data": results,
-        "pagination": {
-            "page": page,
-            "per_page": per_page,
-            "total": paginated.total,
-            "pages": paginated.pages
-        }
-    }), 200
-    
+        "pagination": { "page": page, "per_page": per_page, "total": paginated.total, "pages": paginated.pages }
+    }), 200   
 @core.route('/stock/recalibrate', methods=['POST'])
 @jwt_required
 def recalibrate_stock():
