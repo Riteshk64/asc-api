@@ -1,15 +1,11 @@
-import os  
 from flask import Blueprint, request, jsonify, current_app
 from app.auth.firebase import verify_firebase_token
 from app.auth.jwt_utils import generate_jwt
 from app.models.user import User
 from app.extensions import db
 from app.models.department import Department
-import jwt
-from app.common.decorators import admin_only
 from app.auth.jwt_middleware import jwt_required
 from flask import g
-
 
 auth = Blueprint('auth', __name__, url_prefix='/auth')
 
@@ -69,6 +65,7 @@ def get_current_user():
         "approval_status": user.approval_status,
         "requested_department_id": user.requested_department_id
     }), 200
+
 @auth.route("/verify-phone", methods=["POST"])
 def verify_phone():
     data = request.get_json()
@@ -85,7 +82,6 @@ def verify_phone():
 
     user = User.query.filter_by(phoneno=phone).first()
 
-    # ✅ 1. CREATE ROW IMMEDIATELY IF IT DOESN'T EXIST
     if not user:
         user = User(
             phoneno=phone,
@@ -95,11 +91,17 @@ def verify_phone():
         )
         db.session.add(user)
         db.session.commit()
+    
+        g.current_user = user
+        g.user_id = user.id
+        g.role = user.role
+        g.department_id = user.department_id
+        current_app.logger.info("request_started")
 
-    # ✅ 2. PROFILE IS COMPLETE ONLY IF THEY HAVE A NAME
+    # 2. PROFILE IS COMPLETE ONLY IF THEY HAVE A NAME
     is_profile_done = bool(user.first_name and user.department_id)
 
-    # ✅ 3. ISSUE A REAL TOKEN WITH A USER ID
+    # 3. ISSUE A REAL TOKEN WITH A USER ID
     token = generate_jwt(
         {
             "user_id": user.id,
@@ -151,7 +153,6 @@ def create_profile():
         "role": user.role
     }), 200
 
-
 @auth.route("/profile/update", methods=["PUT"])
 @jwt_required
 def update_profile():
@@ -201,7 +202,3 @@ def update_profile():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
-@auth.route("/test")
-def test():
-    return jsonify({"message": "Auth route is working!"})

@@ -85,6 +85,7 @@ def jwt_required(fn):
             g.role = user.role
             g.department_id = user.department_id
 
+            current_app.logger.info("request_started")
             
             # ✅ CRITICAL FIX: If user was deleted in Supabase, return 401 immediately!
             # This triggers the frontend to log them out and go to Sign In.
