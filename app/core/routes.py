@@ -1123,13 +1123,13 @@ def export_products_pdf():
 
     results = query.all()
     
-    # 👇 NEW: Fetch all contextual sub-category orders at once
+    # Fetch all contextual sub-category orders at once
     cso_records = CategorySubOrder.query.all()
     cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
 
     groups = {}
     cat_orders = {}
-    sub_orders = {} # Nested dict: sub_orders[cat_name][sub_name]
+    sub_orders = {}
 
     for p, t_in, t_out in results:
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
@@ -1140,7 +1140,6 @@ def export_products_pdf():
         if cat_name not in sub_orders:
             sub_orders[cat_name] = {}
             
-        # 👇 NEW: Look up the specific order for this exact Category + SubCategory combo
         sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
 
         if cat_name not in groups: groups[cat_name] = {}
@@ -1162,7 +1161,6 @@ def export_products_pdf():
     for cat_name in sorted_cats:
         rows_html += f'<tr><td colspan="5" style="background-color:#1e293b; color:#fff; font-weight:bold; text-align:center; padding:10px;">{cat_name} Category</td></tr>'
         
-        # 👇 UPDATED: Sort using the contextual order for this specific category
         sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders[cat_name].get(s, 9999), s))
         
         for sub_name in sorted_subs:
@@ -1180,6 +1178,8 @@ def export_products_pdf():
                 """
 
     date_text = f"{start_str} to {end_str}" if is_custom_range else "All Time"
+    
+    # 👇 THE FIX: Removed '-pdf-keep-with-next: true;' from the table CSS so it doesn't OOM the server!
     html_content = f"""
       <html>
         <head>
@@ -1190,7 +1190,7 @@ def export_products_pdf():
             }}
             body {{ font-family: Helvetica, Arial, sans-serif; color: #334155; }}
             .header {{ text-align: center; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; -pdf-keep-with-next: true; }}
+            table {{ width: 100%; border-collapse: collapse; }} 
             th, td {{ border: 1px solid #e2e8f0; padding: 6px 8px; font-size: 10px; }}
             th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; text-align: left; }}
           </style>
@@ -1215,7 +1215,6 @@ def export_products_pdf():
     if pisa_status.err: return jsonify({"error": "Failed to generate PDF"}), 500
     pdf_bytes.seek(0)
     return Response(pdf_bytes.read(), mimetype="application/pdf", headers={"Content-Disposition": "attachment;filename=inventory_report.pdf"})
-
 
 @core.route('/products/export/csv', methods=['GET'])
 @jwt_required
