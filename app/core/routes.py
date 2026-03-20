@@ -717,6 +717,27 @@ def get_products():
             "pages": pagination.pages
         }
     }), 200
+
+
+@core.route('/products/search', methods=['GET'])
+@jwt_required
+def search_products():
+    active_dept = get_active_department()
+    search_term = request.args.get('search', '').strip()
+
+    query = Product.query.filter_by(department_id=active_dept, is_active=True)
+
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+
+    # Fast, lightweight query. Limits to top 50 matches for the dropdown.
+    products = query.order_by(Product.name.asc()).limit(50).all()
+    
+    return jsonify([{"id": p.id, "name": p.name, "sku": p.product_code} for p in products]), 200
+
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
