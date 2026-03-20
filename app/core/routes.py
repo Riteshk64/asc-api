@@ -1110,7 +1110,6 @@ def export_products_pdf():
         Product.is_active == True
     )
 
-    # 👇 Apply the same Inner Join fix here for PDFs
     if is_custom_range:
         query = query.join(txn_subq, Product.id == txn_subq.c.product_id)
     else:
@@ -1123,15 +1122,26 @@ def export_products_pdf():
         ))
 
     results = query.all()
+    
+    # 👇 NEW: Fetch all contextual sub-category orders at once
+    cso_records = CategorySubOrder.query.all()
+    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
+
     groups = {}
     cat_orders = {}
-    sub_orders = {}
+    sub_orders = {} # Nested dict: sub_orders[cat_name][sub_name]
 
     for p, t_in, t_out in results:
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
-        cat_orders[cat_name] = p.category_rel.display_order if p.category_rel else 9999
-        sub_orders[sub_name] = p.sub_category_rel.display_order if p.sub_category_rel else 9999
+        
+        cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
+        
+        if cat_name not in sub_orders:
+            sub_orders[cat_name] = {}
+            
+        # 👇 NEW: Look up the specific order for this exact Category + SubCategory combo
+        sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
 
         if cat_name not in groups: groups[cat_name] = {}
         if sub_name not in groups[cat_name]: groups[cat_name][sub_name] = []
@@ -1151,7 +1161,9 @@ def export_products_pdf():
     
     for cat_name in sorted_cats:
         rows_html += f'<tr><td colspan="5" style="background-color:#1e293b; color:#fff; font-weight:bold; text-align:center; padding:10px;">{cat_name} Category</td></tr>'
-        sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders.get(s, 9999), s))
+        
+        # 👇 UPDATED: Sort using the contextual order for this specific category
+        sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders[cat_name].get(s, 9999), s))
         
         for sub_name in sorted_subs:
             rows_html += f'<tr><td colspan="5" style="background-color:#f1f5f9; font-weight:bold; padding:8px; font-size:10px; border-left:4px solid #3b82f6;">{sub_name}</td></tr>'
@@ -1212,18 +1224,20 @@ def export_products_csv():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    # 1. Get exact same filters the frontend is currently viewing
     search_term = request.args.get('search', '').strip()
-    start_str = request.args.get('start_date')
-    end_str = request.args.get('end_date')
-    
-    # Optional: Get category filters if you pass them (e.g., ?cats=1,2,3)
     cat_ids = request.args.get('cats', '') 
     sub_ids = request.args.get('subs', '')
 
-    # 2. Build the exact same base query (I'm summarizing the joins for brevity, 
-    # use the same txn_subq logic you have in get_products)
-    query = db.session.query(Product).filter(
+    # We need to join the tables to sort by display_order
+    query = db.session.query(Product).outerjoin(
+        Category, Product.category_id == Category.id
+    ).outerjoin(
+        SubCategory, Product.sub_category_id == SubCategory.id
+    ).outerjoin(
+        # 👇 NEW: Join the contextual ordering table mapping the category to the subcategory
+        CategorySubOrder, 
+        and_(CategorySubOrder.category_id == Product.category_id, CategorySubOrder.sub_category_id == Product.sub_category_id)
+    ).filter(
         Product.department_id == active_dept,
         Product.is_active == True
     )
@@ -1238,37 +1252,37 @@ def export_products_csv():
         cat_list = [int(x) for x in cat_ids.split(',')]
         query = query.filter(Product.category_id.in_(cat_list))
 
-    # Fetch all matching products (Database handles this instantly)
-    products = query.order_by(Product.category_id, Product.sub_category_id).all()
+    if sub_ids:
+        sub_list = [int(x) for x in sub_ids.split(',')]
+        query = query.filter(Product.sub_category_id.in_(sub_list))
 
-    # 3. Build the CSV in memory (No saving to disk required)
+    # 👇 NEW: Order by Category display_order, THEN CategorySubOrder display_order
+    products = query.order_by(
+        Category.display_order.asc().nulls_last(),
+        CategorySubOrder.display_order.asc().nulls_last(),
+        Product.product_code.asc()
+    ).all()
+
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Write Headers
     writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'Current Stock'])
 
-    # Write Data
     for p in products:
         writer.writerow([
             p.category_rel.name if p.category_rel else 'OTHER',
             p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
             p.product_code,
             p.name,
-            p.current_stock # Use your total_in / total_out logic here if needed
+            p.current_stock
         ])
 
-    # 4. Return as a downloadable file
     output.seek(0)
     return Response(
         output,
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment;filename=inventory_report.csv"}
-
-
     )
-
-
 import csv
 import io
 from flask import Response
