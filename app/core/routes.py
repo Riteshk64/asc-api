@@ -638,12 +638,9 @@ def get_products():
 
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
-    # 👇 1. Grab the search term from the query params
     search_term = request.args.get('search', '').strip()
     cat_ids = request.args.get('cats', '')
     sub_ids = request.args.get('subs', '')
-
-    
 
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
@@ -656,23 +653,22 @@ def get_products():
                       (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
     ).filter(Transaction.is_active == True)
 
+    is_date_filtered = False
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
             end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
             txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+            is_date_filtered = True
         except ValueError:
             pass
 
     txn_subq = txn_query.group_by(Transaction.product_id).subquery()
 
-    # 👇 2. Define the base query without pagination yet
     base_query = db.session.query(
         Product,
         func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
         func.coalesce(txn_subq.c.t_out, 0).label('total_out')
-    ).outerjoin(
-        txn_subq, Product.id == txn_subq.c.product_id
     ).options(
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
@@ -680,6 +676,12 @@ def get_products():
         Product.department_id == active_dept,
         Product.is_active == True
     )
+
+    # 👇 THE FIX: Inner Join if dates are selected (only show items that moved). Else Outer Join (show whole catalog)
+    if is_date_filtered:
+        base_query = base_query.join(txn_subq, Product.id == txn_subq.c.product_id)
+    else:
+        base_query = base_query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
 
     if search_term:
         base_query = base_query.filter(
@@ -689,7 +691,6 @@ def get_products():
             )
         )
 
-    # 👇 2. Apply the Checkbox Filters BEFORE paginating
     if cat_ids:
         cat_list = [int(x) for x in cat_ids.split(',')]
         base_query = base_query.filter(Product.category_id.in_(cat_list))
@@ -698,14 +699,10 @@ def get_products():
         sub_list = [int(x) for x in sub_ids.split(',')]
         base_query = base_query.filter(Product.sub_category_id.in_(sub_list))
 
-    # 👇 3. Finally, paginate the filtered results
-    pagination = base_query.order_by(Product.id.desc())\
-     .paginate(page=page, per_page=per_page, error_out=False)
-
-    results = pagination.items
+    pagination = base_query.order_by(Product.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
 
     data = []
-    for p, t_in, t_out in results:
+    for p, t_in, t_out in pagination.items:
         p_dict = p.to_dict()
         p_dict['total_stock_in'] = float(t_in)
         p_dict['total_stock_out'] = float(t_out)
@@ -720,8 +717,6 @@ def get_products():
             "pages": pagination.pages
         }
     }), 200
-
-
 # @core.route('/products/<int:id>', methods=['PUT'])
 # @jwt_required
 # def update_product(id):
@@ -1041,9 +1036,15 @@ def get_transactions():
 
 
 from flask import Response
-from weasyprint import HTML
+
 from sqlalchemy import func, case, and_, or_
 from sqlalchemy.orm import joinedload
+
+
+
+import csv
+import io
+from flask import Response
 
 @core.route('/products/export/pdf', methods=['GET'])
 @jwt_required
@@ -1052,12 +1053,10 @@ def export_products_pdf():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
-    # 1. Grab filters
     search_term = request.args.get('search', '').strip()
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
 
-    # 2. Build the exact same Transaction Subquery to get accurate In/Out numbers
     txn_query = db.session.query(
         Transaction.product_id,
         func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
@@ -1078,13 +1077,10 @@ def export_products_pdf():
 
     txn_subq = txn_query.group_by(Transaction.product_id).subquery()
 
-    # 3. Build Base Query
     query = db.session.query(
         Product,
         func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
         func.coalesce(txn_subq.c.t_out, 0).label('total_out')
-    ).outerjoin(
-        txn_subq, Product.id == txn_subq.c.product_id
     ).options(
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
@@ -1093,19 +1089,19 @@ def export_products_pdf():
         Product.is_active == True
     )
 
+    # 👇 Apply the same Inner Join fix here for PDFs
+    if is_custom_range:
+        query = query.join(txn_subq, Product.id == txn_subq.c.product_id)
+    else:
+        query = query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
+
     if search_term:
         query = query.filter(or_(
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
 
-    # Fetch EVERYTHING matching the filters (No pagination)
-    # Fetch EVERYTHING matching the filters (No pagination)
     results = query.all()
-
-    # ==========================================
-    # 4. Group the Data & Track Display Orders
-    # ==========================================
     groups = {}
     cat_orders = {}
     sub_orders = {}
@@ -1113,17 +1109,12 @@ def export_products_pdf():
     for p, t_in, t_out in results:
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
-
-        # Safely extract the database display_order (fallback to 9999 for nulls/others)
         cat_orders[cat_name] = p.category_rel.display_order if p.category_rel else 9999
         sub_orders[sub_name] = p.sub_category_rel.display_order if p.sub_category_rel else 9999
 
-        if cat_name not in groups:
-            groups[cat_name] = {}
-        if sub_name not in groups[cat_name]:
-            groups[cat_name][sub_name] = []
+        if cat_name not in groups: groups[cat_name] = {}
+        if sub_name not in groups[cat_name]: groups[cat_name][sub_name] = []
 
-        # Calculate exact stock based on active range
         current_stock = (t_in - t_out) if is_custom_range else p.current_stock
 
         groups[cat_name][sub_name].append({
@@ -1134,29 +1125,20 @@ def export_products_pdf():
             "stock": int(current_stock)
         })
 
-    # ==========================================
-    # 5. Build HTML String with Strict Sorting
-    # ==========================================
     rows_html = ""
-    
-    # 1st Sort: Categories by display_order, then tie-break alphabetically
     sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
     
     for cat_name in sorted_cats:
         rows_html += f'<tr><td colspan="5" style="background-color:#1e293b; color:#fff; font-weight:bold; text-align:center; padding:10px;">{cat_name} Category</td></tr>'
-        
-        # 2nd Sort: Sub-Categories by display_order, then tie-break alphabetically
         sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders.get(s, 9999), s))
         
         for sub_name in sorted_subs:
             rows_html += f'<tr><td colspan="5" style="background-color:#f1f5f9; font-weight:bold; padding:8px; font-size:10px; border-left:4px solid #3b82f6;">{sub_name}</td></tr>'
-            
-            # 3rd Sort: Items by Product Code
             items = sorted(groups[cat_name][sub_name], key=lambda x: str(x['code']).upper())
             for item in items:
                 rows_html += f"""
                 <tr>
-                  <td style="width: 20%; font-family: monospace;">{item['code']}</td>
+                  <td style="width: 20%;">{item['code']}</td>
                   <td style="width: 45%;">{item['name']}</td>
                   <td style="text-align: right;">{item['in']}</td>
                   <td style="text-align: right;">{item['out']}</td>
@@ -1165,24 +1147,28 @@ def export_products_pdf():
                 """
 
     date_text = f"{start_str} to {end_str}" if is_custom_range else "All Time"
-    
     html_content = f"""
       <html>
         <head>
           <style>
-            body {{ font-family: Helvetica, Arial, sans-serif; padding: 10px; color: #334155; }}
-            .header {{ text-align: center; border-bottom: 3px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-            th, td {{ border: 1px solid #e2e8f0; padding: 6px 8px; font-size: 9px; word-wrap: break-word; }}
-            th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; text-align: left; font-size: 10px; }}
+            @page {{
+                size: A4; margin: 1cm;
+                @frame footer {{ -pdf-frame-content: footerContent; bottom: 0cm; margin-left: 1cm; margin-right: 1cm; height: 1cm; text-align: right; font-size: 9px; color: #94a3b8; }}
+            }}
+            body {{ font-family: Helvetica, Arial, sans-serif; color: #334155; }}
+            .header {{ text-align: center; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; -pdf-keep-with-next: true; }}
+            th, td {{ border: 1px solid #e2e8f0; padding: 6px 8px; font-size: 10px; }}
+            th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; text-align: left; }}
           </style>
         </head>
         <body>
+          <div id="footerContent">Page <pdf:pagenumber> of <pdf:pagecount></div>
           <div class="header">
             <h2 style="margin:0; color:#1e40af;">Inventory Report</h2>
             <p style="margin:5px 0; font-size:11px; color:#64748b;">Report Period: {date_text}</p>
           </div>
-          <table>
+          <table repeat="1">
             <thead>
               <tr><th style="width: 20%;">Code</th><th style="width: 45%;">Item Name</th><th style="width: 10%; text-align: right;">In</th><th style="width: 10%; text-align: right;">Out</th><th style="width: 15%; text-align: right;">Stock</th></tr>
             </thead>
@@ -1191,19 +1177,12 @@ def export_products_pdf():
         </body>
       </html>
     """
+    pdf_bytes = io.BytesIO()
+    pisa_status = pisa.CreatePDF(html_content, dest=pdf_bytes)
+    if pisa_status.err: return jsonify({"error": "Failed to generate PDF"}), 500
+    pdf_bytes.seek(0)
+    return Response(pdf_bytes.read(), mimetype="application/pdf", headers={"Content-Disposition": "attachment;filename=inventory_report.pdf"})
 
-    # 6. Convert HTML to PDF and stream to frontend
-    pdf_bytes = HTML(string=html_content).write_pdf()
-    
-    return Response(
-        pdf_bytes,
-        mimetype="application/pdf",
-        headers={"Content-Disposition": "attachment;filename=inventory_report.pdf"}
-    )
-
-import csv
-import io
-from flask import Response
 
 @core.route('/products/export/csv', methods=['GET'])
 @jwt_required
@@ -1272,7 +1251,10 @@ def export_products_csv():
 import csv
 import io
 from flask import Response
-from weasyprint import HTML
+from xhtml2pdf import pisa
+import io
+from sqlalchemy import func, case, and_, or_
+from sqlalchemy.orm import joinedload
 
 @core.route('/transactions/export/csv', methods=['GET'])
 @jwt_required
@@ -1339,96 +1321,6 @@ def export_transactions_csv():
         mimetype="text/csv", 
         headers={"Content-Disposition": "attachment;filename=Transaction_History.csv"}
     )
-
-
-@core.route('/transactions/export/pdf', methods=['GET'])
-@jwt_required
-def export_transactions_pdf():
-    start_str = request.args.get('start_date')
-    end_str = request.args.get('end_date')
-    search_term = request.args.get('search', '').strip()
-    active_dept = get_active_department()
-
-    # 1. Base transaction query
-    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
-        except ValueError: pass
-    txn_subq = base_txn.subquery()
-
-    # 2. Group by Product and sum
-    query = db.session.query(
-        Product.name.label('product_name'),
-        Product.product_code.label('sku'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
-    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
-
-    if active_dept: query = query.filter(Product.department_id == active_dept)
-    if search_term: query = query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
-
-    query = query.group_by(Product.id, Product.name, Product.product_code)
-    results = query.order_by(Product.name.asc()).all()
-
-    # 3. Generate HTML rows mirroring the UI
-    rows_html = ""
-    for r in results:
-        in_text = f"{float(r.total_in)}"
-        if float(r.return_in) > 0: in_text += f" ({float(r.return_in)} R)"
-        
-        out_text = f"{float(r.total_out)}"
-        if float(r.return_out) > 0: out_text += f" ({float(r.return_out)} R)"
-
-        rows_html += f"""
-        <tr>
-            <td><strong>{r.product_name}</strong><br><span style="color:#64748b; font-size:10px;">{r.sku or '-'}</span></td>
-            <td style="color:#15803d; font-weight:bold;">IN: {in_text}</td>
-            <td style="color:#b91c1c; font-weight:bold;">OUT: {out_text}</td>
-        </tr>
-        """
-
-    range_header = f"{start_str} to {end_str}" if start_str and end_str else "All Time History"
-
-    html = f"""
-      <html>
-      <head>
-        <style>
-          body {{ font-family: sans-serif; padding: 20px; color: #334155; }}
-          .header-box {{ text-align: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 20px; margin-bottom: 20px; }}
-          h2 {{ color: #1e40af; margin: 0; text-transform: uppercase; }}
-          .date-range {{ font-size: 14px; color: #64748b; margin-top: 5px; font-weight: bold; }}
-          table {{ width: 100%; border-collapse: collapse; }}
-          th, td {{ border: 1px solid #e5e7eb; padding: 10px; font-size: 12px; }}
-          th {{ background-color: #f8fafc; color: #475569; text-transform: uppercase; text-align: left; }}
-        </style>
-      </head>
-      <body>
-        <div class="header-box">
-          <h2>Transaction Summary Report</h2>
-          <div class="date-range">Report Period: {range_header}</div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th style="width: 50%;">Product & SKU</th>
-              <th style="width: 25%;">Total In</th>
-              <th style="width: 25%;">Total Out</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-      </body>
-      </html>
-    """
-    pdf_bytes = HTML(string=html).write_pdf()
-    return Response(pdf_bytes, mimetype="application/pdf", headers={"Content-Disposition": "attachment;filename=Transaction_History.pdf"})
 
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
