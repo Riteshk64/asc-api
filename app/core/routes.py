@@ -1067,9 +1067,9 @@ import csv
 import io
 from flask import Response
 
-@core.route('/products/export/pdf', methods=['GET'])
+@core.route('/products/export/json', methods=['GET'])
 @jwt_required
-def export_products_pdf():
+def export_products_json():
     active_dept = get_active_department()
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
@@ -1123,7 +1123,6 @@ def export_products_pdf():
 
     results = query.all()
     
-    # Fetch all contextual sub-category orders at once
     cso_records = CategorySubOrder.query.all()
     cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
 
@@ -1136,9 +1135,7 @@ def export_products_pdf():
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
         
         cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
-        
-        if cat_name not in sub_orders:
-            sub_orders[cat_name] = {}
+        if cat_name not in sub_orders: sub_orders[cat_name] = {}
             
         sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
 
@@ -1155,66 +1152,30 @@ def export_products_pdf():
             "stock": int(current_stock)
         })
 
-    rows_html = ""
+    # 👇 Build a clean, flat list for the frontend to easily draw
+    export_data = []
     sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
     
     for cat_name in sorted_cats:
-        rows_html += f'<tr><td colspan="5" style="background-color:#1e293b; color:#fff; font-weight:bold; text-align:center; padding:10px;">{cat_name} Category</td></tr>'
-        
+        export_data.append({"type": "category", "title": f"{cat_name} Category"})
         sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders[cat_name].get(s, 9999), s))
         
         for sub_name in sorted_subs:
-            rows_html += f'<tr><td colspan="5" style="background-color:#f1f5f9; font-weight:bold; padding:8px; font-size:10px; border-left:4px solid #3b82f6;">{sub_name}</td></tr>'
+            export_data.append({"type": "subcategory", "title": sub_name})
             items = sorted(groups[cat_name][sub_name], key=lambda x: str(x['code']).upper())
             for item in items:
-                rows_html += f"""
-                <tr>
-                  <td style="width: 20%;">{item['code']}</td>
-                  <td style="width: 45%;">{item['name']}</td>
-                  <td style="text-align: right;">{item['in']}</td>
-                  <td style="text-align: right;">{item['out']}</td>
-                  <td style="text-align: right; font-weight:bold;">{item['stock']}</td>
-                </tr>
-                """
+                export_data.append({
+                    "type": "item", "code": item['code'], "name": item['name'], 
+                    "in": item['in'], "out": item['out'], "stock": item['stock']
+                })
 
-    date_text = f"{start_str} to {end_str}" if is_custom_range else "All Time"
-    
-    # 👇 THE FIX: Removed '-pdf-keep-with-next: true;' from the table CSS so it doesn't OOM the server!
-    html_content = f"""
-      <html>
-        <head>
-          <style>
-            @page {{
-                size: A4; margin: 1cm;
-                @frame footer {{ -pdf-frame-content: footerContent; bottom: 0cm; margin-left: 1cm; margin-right: 1cm; height: 1cm; text-align: right; font-size: 9px; color: #94a3b8; }}
-            }}
-            body {{ font-family: Helvetica, Arial, sans-serif; color: #334155; }}
-            .header {{ text-align: center; border-bottom: 2px solid #3b82f6; padding-bottom: 10px; margin-bottom: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; }} 
-            th, td {{ border: 1px solid #e2e8f0; padding: 6px 8px; font-size: 10px; }}
-            th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; text-align: left; }}
-          </style>
-        </head>
-        <body>
-          <div id="footerContent">Page <pdf:pagenumber> of <pdf:pagecount></div>
-          <div class="header">
-            <h2 style="margin:0; color:#1e40af;">Inventory Report</h2>
-            <p style="margin:5px 0; font-size:11px; color:#64748b;">Report Period: {date_text}</p>
-          </div>
-          <table repeat="1">
-            <thead>
-              <tr><th style="width: 20%;">Code</th><th style="width: 45%;">Item Name</th><th style="width: 10%; text-align: right;">In</th><th style="width: 10%; text-align: right;">Out</th><th style="width: 15%; text-align: right;">Stock</th></tr>
-            </thead>
-            <tbody>{rows_html}</tbody>
-          </table>
-        </body>
-      </html>
-    """
-    pdf_bytes = io.BytesIO()
-    pisa_status = pisa.CreatePDF(html_content, dest=pdf_bytes)
-    if pisa_status.err: return jsonify({"error": "Failed to generate PDF"}), 500
-    pdf_bytes.seek(0)
-    return Response(pdf_bytes.read(), mimetype="application/pdf", headers={"Content-Disposition": "attachment;filename=inventory_report.pdf"})
+    return jsonify(export_data), 200
+
+
+import csv
+import io
+from flask import Response
+from sqlalchemy import func, and_, or_
 
 @core.route('/products/export/csv', methods=['GET'])
 @jwt_required
@@ -1227,13 +1188,13 @@ def export_products_csv():
     cat_ids = request.args.get('cats', '') 
     sub_ids = request.args.get('subs', '')
 
-    # We need to join the tables to sort by display_order
+    # Join the tables to sort by display_order
     query = db.session.query(Product).outerjoin(
         Category, Product.category_id == Category.id
     ).outerjoin(
         SubCategory, Product.sub_category_id == SubCategory.id
     ).outerjoin(
-        # 👇 NEW: Join the contextual ordering table mapping the category to the subcategory
+        # Join the contextual ordering table mapping the category to the subcategory
         CategorySubOrder, 
         and_(CategorySubOrder.category_id == Product.category_id, CategorySubOrder.sub_category_id == Product.sub_category_id)
     ).filter(
@@ -1255,7 +1216,7 @@ def export_products_csv():
         sub_list = [int(x) for x in sub_ids.split(',')]
         query = query.filter(Product.sub_category_id.in_(sub_list))
 
-    # 👇 NEW: Order by Category display_order, THEN CategorySubOrder display_order
+    # Order by Category display_order, THEN CategorySubOrder display_order
     products = query.order_by(
         Category.display_order.asc().nulls_last(),
         CategorySubOrder.display_order.asc().nulls_last(),
@@ -1276,12 +1237,12 @@ def export_products_csv():
             p.current_stock
         ])
 
-    output.seek(0)
     return Response(
-        output,
+        output.getvalue(),
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment;filename=inventory_report.csv"}
     )
+
 import csv
 import io
 from flask import Response
