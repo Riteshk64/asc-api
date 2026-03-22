@@ -651,7 +651,7 @@ def get_products():
                       (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
         func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
                       (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-    ).filter(Transaction.is_active == True)
+    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept)
 
     is_date_filtered = False
     if start_str and end_str:
@@ -2042,11 +2042,12 @@ def add_contractor():
 @jwt_required
 def get_categories():
     cats = Category.query.order_by(Category.display_order.asc(), Category.id.asc()).all()
+    active_dept = get_active_department()
     
     # 👇 1. Scan the ENTIRE database for all unique Category + SubCategory pairs currently in use.
     # This completely bypasses the 50-item pagination limit.
     active_pairs = db.session.query(Product.category_id, Product.sub_category_id)\
-        .filter(Product.is_active == True)\
+        .filter(Product.is_active == True, Product.department_id == active_dept)\
         .distinct().all()
         
     # 👇 2. Group those pairs by category_id
