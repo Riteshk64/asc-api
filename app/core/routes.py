@@ -993,8 +993,11 @@ def get_transactions():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    # 1. Filter the raw transactions by date FIRST
-    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
+    # 👇 THE FIX: Filter transactions by department IMMEDIATELY!
+    base_txn = db.session.query(Transaction).filter(
+        Transaction.is_active == True,
+        Transaction.department_id == active_dept
+    )
     
     if start_str and end_str:
         try:
@@ -1077,6 +1080,10 @@ def export_products_json():
     search_term = request.args.get('search', '').strip()
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
+    
+    # 👇 ADDED: Retrieve the checkbox filters from the URL
+    cat_ids = request.args.get('cats', '')
+    sub_ids = request.args.get('subs', '')
 
     txn_query = db.session.query(
         Transaction.product_id,
@@ -1084,7 +1091,7 @@ def export_products_json():
                       (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
         func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
                       (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-    ).filter(Transaction.is_active == True)
+    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept) # 👈 Department filter secured
 
     is_custom_range = False
     if start_str and end_str:
@@ -1115,11 +1122,21 @@ def export_products_json():
     else:
         query = query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
 
+    # 👇 ADDED: Apply the Search Filter
     if search_term:
         query = query.filter(or_(
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
+
+    # 👇 ADDED: Apply the Category & Sub-Category Filters
+    if cat_ids:
+        cat_list = [int(x) for x in cat_ids.split(',')]
+        query = query.filter(Product.category_id.in_(cat_list))
+
+    if sub_ids:
+        sub_list = [int(x) for x in sub_ids.split(',')]
+        query = query.filter(Product.sub_category_id.in_(sub_list))
 
     results = query.all()
     
@@ -1152,7 +1169,6 @@ def export_products_json():
             "stock": int(current_stock)
         })
 
-    # 👇 Build a clean, flat list for the frontend to easily draw
     export_data = []
     sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
     
@@ -1172,11 +1188,6 @@ def export_products_json():
     return jsonify(export_data), 200
 
 
-import csv
-import io
-from flask import Response
-from sqlalchemy import func, and_, or_
-
 @core.route('/products/export/csv', methods=['GET'])
 @jwt_required
 def export_products_csv():
@@ -1185,29 +1196,57 @@ def export_products_csv():
         return jsonify({"error": "Department context missing"}), 400
 
     search_term = request.args.get('search', '').strip()
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
     cat_ids = request.args.get('cats', '') 
     sub_ids = request.args.get('subs', '')
 
-    # Join the tables to sort by display_order
-    query = db.session.query(Product).outerjoin(
-        Category, Product.category_id == Category.id
-    ).outerjoin(
-        SubCategory, Product.sub_category_id == SubCategory.id
-    ).outerjoin(
-        # Join the contextual ordering table mapping the category to the subcategory
-        CategorySubOrder, 
-        and_(CategorySubOrder.category_id == Product.category_id, CategorySubOrder.sub_category_id == Product.sub_category_id)
+    # 👇 UPDATED: CSV now uses the exact same time-bound transaction math as the UI!
+    txn_query = db.session.query(
+        Transaction.product_id,
+        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
+        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
+                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
+    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept)
+
+    is_custom_range = False
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+            is_custom_range = True
+        except ValueError:
+            pass
+
+    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
+
+    query = db.session.query(
+        Product,
+        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
+        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
+    ).options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
     ).filter(
         Product.department_id == active_dept,
         Product.is_active == True
     )
 
+    if is_custom_range:
+        query = query.join(txn_subq, Product.id == txn_subq.c.product_id)
+    else:
+        query = query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
+
+    # 👇 ADDED: Search Filter
     if search_term:
         query = query.filter(or_(
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
 
+    # 👇 ADDED: Category Filters
     if cat_ids:
         cat_list = [int(x) for x in cat_ids.split(',')]
         query = query.filter(Product.category_id.in_(cat_list))
@@ -1216,25 +1255,37 @@ def export_products_csv():
         sub_list = [int(x) for x in sub_ids.split(',')]
         query = query.filter(Product.sub_category_id.in_(sub_list))
 
-    # Order by Category display_order, THEN CategorySubOrder display_order
-    products = query.order_by(
-        Category.display_order.asc().nulls_last(),
-        CategorySubOrder.display_order.asc().nulls_last(),
-        Product.product_code.asc()
-    ).all()
+    results = query.all()
+    
+    # Pull dynamic sorting data
+    cso_records = CategorySubOrder.query.all()
+    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
+
+    def get_sort_keys(row):
+        p, t_in, t_out = row
+        cat_order = p.category_rel.display_order if p.category_rel else 9999
+        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
+        sub_order = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
+        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
+        return (cat_order, cat_name, sub_order, sub_name, p.product_code or '')
+
+    results.sort(key=get_sort_keys)
 
     output = io.StringIO()
     writer = csv.writer(output)
     
-    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'Current Stock'])
+    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Stock'])
 
-    for p in products:
+    for p, t_in, t_out in results:
+        current_stock = (t_in - t_out) if is_custom_range else p.current_stock
         writer.writerow([
             p.category_rel.name if p.category_rel else 'OTHER',
             p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
             p.product_code,
             p.name,
-            p.current_stock
+            int(t_in),
+            int(t_out),
+            int(current_stock)
         ])
 
     return Response(
@@ -1242,6 +1293,12 @@ def export_products_csv():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment;filename=inventory_report.csv"}
     )
+
+import csv
+import io
+from flask import Response
+from sqlalchemy import func, and_, or_
+
 
 import csv
 import io
