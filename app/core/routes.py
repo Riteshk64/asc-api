@@ -2471,12 +2471,23 @@ def add_product():
         cat_name = data.get('category_name', 'OTHER').strip().upper()
         category = Category.query.filter_by(name=cat_name).first()
         if not category:
-            category = Category(name=cat_name)
+            max_order = db.session.query(func.max(Category.display_order)).scalar()
+            next_order = (max_order or 0) + 1
+            
+            category = Category(name=cat_name, display_order=next_order)
+            db.session.add(category)
+            db.session.flush()
 
         sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
         sub_category = SubCategory.query.filter_by(name=sub_name).first()
         if not sub_category:
-            sub_category = SubCategory(name=sub_name)
+            # Do the exact same thing for SubCategories!
+            max_sub_order = db.session.query(func.max(SubCategory.display_order)).scalar()
+            next_sub_order = (max_sub_order or 0) + 1
+            
+            sub_category = SubCategory(name=sub_name, display_order=next_sub_order)
+            db.session.add(sub_category)
+            db.session.flush()
 
         new_product = Product(
             name=product_name,
