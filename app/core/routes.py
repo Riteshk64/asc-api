@@ -2098,18 +2098,20 @@ def add_contractor():
 @core.route('/categories', methods=['GET'])
 @jwt_required
 def get_categories():
-    cats = Category.query.order_by(Category.display_order.asc(), Category.id.asc()).all()
-    active_dept = get_active_department()
+    # 1. Fetch only active categories
+    cats = Category.query.filter_by(is_active=True).order_by(Category.display_order.asc(), Category.id.asc()).all()
     
-    # 👇 1. Scan the ENTIRE database for all unique Category + SubCategory pairs currently in use.
-    # This completely bypasses the 50-item pagination limit.
+    # 2. THE FIX: Remove the strict department filter. 
+    # Scan the entire Product table globally to find all used Category/SubCategory pairs.
     active_pairs = db.session.query(Product.category_id, Product.sub_category_id)\
-        .filter(Product.is_active == True, Product.department_id == active_dept)\
+        .filter(Product.is_active == True)\
         .distinct().all()
         
-    # 👇 2. Group those pairs by category_id
     used_subs_by_cat = {}
     for cid, sid in active_pairs:
+        # Ignore products that don't have a category assigned
+        if cid is None: continue 
+        
         if cid not in used_subs_by_cat:
             used_subs_by_cat[cid] = set()
         if sid:
@@ -2117,12 +2119,12 @@ def get_categories():
 
     result = []
     for c in cats:
-        # 3. Get any manual sorting orders the user set via the Manage Order modal
+        # 3. Pull manual sorting overrides (if any exist)
         sub_orders_query = CategorySubOrder.query.filter_by(category_id=c.id).all()
         sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
         
-        # 👇 4. THE MAGIC: Merge the database reality with the sorting dictionary.
-        # If a product links a sub-category to this category, guarantee it exists in the dictionary!
+        # 4. Inject the dynamically found subcategories into the dictionary 
+        # so the frontend Modal always sees them
         dynamic_subs = used_subs_by_cat.get(c.id, set())
         for sid in dynamic_subs:
             if sid not in sub_orders_dict:
@@ -2132,12 +2134,10 @@ def get_categories():
             "id": c.id, 
             "name": c.name, 
             "display_order": c.display_order,
-            # Now contains EVERY sub-category, even if they are on Page 50!
             "sub_orders": sub_orders_dict 
         })
         
     return jsonify(result), 200
-
 
 @core.route('/categories/reorder', methods=['PUT'])
 @jwt_required
@@ -2268,8 +2268,8 @@ def delete_category(cat_id):
 @core.route('/sub-categories', methods=['GET'])
 @jwt_required
 def get_sub_categories():
-    subs = SubCategory.query.order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
-    # We include display_order so the frontend knows how to sort them globally
+    # Added .filter_by(is_active=True) to ensure deleted subs don't show up in the UI
+    subs = SubCategory.query.filter_by(is_active=True).order_by(SubCategory.display_order.asc(), SubCategory.name.asc()).all()
     return jsonify([{"id": s.id, "name": s.name, "display_order": s.display_order} for s in subs]), 200
 
 @core.route('/sub-categories', methods=['POST'])
