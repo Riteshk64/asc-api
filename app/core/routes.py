@@ -671,7 +671,6 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 
 from sqlalchemy.orm import joinedload
-
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -688,13 +687,40 @@ def get_products():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    txn_query = db.session.query(
-        Transaction.product_id,
-        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
-        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept)
+    # 1. Fetch Filtered Products First
+    base_query = db.session.query(Product).options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
+    ).filter(
+        Product.department_id == active_dept,
+        Product.is_active == True
+    )
+
+    if search_term:
+        base_query = base_query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+    if cat_ids:
+        base_query = base_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
+    if sub_ids:
+        base_query = base_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
+
+    pagination = base_query.order_by(Product.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    products = pagination.items
+
+    if not products:
+        return jsonify({"data": [], "pagination": {"page": page, "per_page": per_page, "total": 0, "pages": 0}}), 200
+
+    product_ids = [p.id for p in products]
+    product_map = {p.id: p for p in products}
+
+    # 2. Fetch Transactions for ONLY the paginated products
+    txn_query = Transaction.query.filter(
+        Transaction.is_active == True,
+        Transaction.department_id == active_dept,
+        Transaction.product_id.in_(product_ids)
+    )
 
     is_date_filtered = False
     if start_str and end_str:
@@ -706,62 +732,35 @@ def get_products():
         except ValueError:
             pass
 
-    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
+    transactions = txn_query.all()
 
-    base_query = db.session.query(
-        Product,
-        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
-        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
-    ).options(
-        joinedload(Product.category_rel),
-        joinedload(Product.sub_category_rel)
-    ).filter(
-        Product.department_id == active_dept,
-        Product.is_active == True
-    )
+    # 3. Python Math Tally (Fixes the 3.2 issue)
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'moved': False} for pid in product_ids}
 
-    # 👇 THE FIX: Inner Join if dates are selected (only show items that moved). Else Outer Join (show whole catalog)
-    if is_date_filtered:
-        base_query = base_query.join(txn_subq, Product.id == txn_subq.c.product_id)
-    else:
-        base_query = base_query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
+    for txn in transactions:
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+        tallies[pid]['moved'] = True
 
-    if search_term:
-        base_query = base_query.filter(
-            or_(
-                Product.name.ilike(f"%{search_term}%"),
-                Product.product_code.ilike(f"%{search_term}%")
-            )
-        )
+        if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
 
-    if cat_ids:
-        cat_list = [int(x) for x in cat_ids.split(',')]
-        base_query = base_query.filter(Product.category_id.in_(cat_list))
-
-    if sub_ids:
-        sub_list = [int(x) for x in sub_ids.split(',')]
-        base_query = base_query.filter(Product.sub_category_id.in_(sub_list))
-
-    pagination = base_query.order_by(Product.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
-
+    # 4. Map to Result
     data = []
-    for p, t_in, t_out in pagination.items:
+    for p in products:
+        if is_date_filtered and not tallies[p.id]['moved']:
+            continue
         p_dict = p.to_dict()
-        p_dict['total_stock_in'] = float(t_in)
-        p_dict['total_stock_out'] = float(t_out)
+        p_dict['total_stock_in'] = tallies[p.id]['t_in']
+        p_dict['total_stock_out'] = tallies[p.id]['t_out']
         data.append(p_dict)
 
     return jsonify({
         "data": data,
-        "pagination": {
-            "page": page,
-            "per_page": per_page,
-            "total": pagination.total,
-            "pages": pagination.pages
-        }
+        "pagination": { "page": page, "per_page": per_page, "total": pagination.total, "pages": pagination.pages }
     }), 200
-
-
 @core.route('/products/search', methods=['GET'])
 @jwt_required
 def search_products():
@@ -1023,7 +1022,6 @@ def get_users():
 
     # Pass is_admin=True so the frontend gets the payroll configuration data
     return jsonify([user.to_dict(is_admin=True) for user in users]), 200
-
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 @admin_only
@@ -1036,71 +1034,76 @@ def get_transactions():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    # 👇 THE FIX: Filter transactions by department IMMEDIATELY!
-    base_txn = db.session.query(Transaction).filter(
-        Transaction.is_active == True,
-        Transaction.department_id == active_dept
-    )
-    
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
-        except ValueError:
-            pass
-
-    txn_subq = base_txn.subquery()
-
-    # 2. Group by Product and do the exact math your frontend used to do
-    query = db.session.query(
-        Product.id.label('product_id'),
-        Product.name.label('product_name'),
-        Product.product_code.label('sku'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
-    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
-
-    if active_dept:
-        query = query.filter(Product.department_id == active_dept)
-
+    # 1. Fetch Filtered Products First
+    query = Product.query.filter_by(is_active=True, department_id=active_dept)
     if search_term:
         query = query.filter(or_(
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
 
-    query = query.group_by(Product.id, Product.name, Product.product_code)
-
-    # 3. Paginate the grouped results
     pagination = query.order_by(Product.name.asc()).paginate(page=page, per_page=per_page, error_out=False)
+    products = pagination.items
 
+    if not products:
+        return jsonify({"data": [], "pagination": {"page": page, "per_page": per_page, "total": 0, "pages": 0}}), 200
+
+    product_ids = [p.id for p in products]
+    product_map = {p.id: p for p in products}
+
+    # 2. Fetch Transactions for ONLY the paginated products
+    txn_query = Transaction.query.filter(
+        Transaction.is_active == True,
+        Transaction.department_id == active_dept,
+        Transaction.product_id.in_(product_ids)
+    )
+
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError:
+            pass
+
+    transactions = txn_query.all()
+
+    # 3. Python Math Tally (Fixes the 3.2 issue)
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'r_in': 0.0, 'r_out': 0.0} for pid in product_ids}
+
+    for txn in transactions:
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+
+        if txn.type == 'in':
+            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out':
+            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'return':
+            if not txn.supplier_id:
+                tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+                tallies[pid]['r_in'] = calculate_new_stock(tallies[pid]['r_in'], txn.quantity, eff_unit, is_adding=True)
+            else:
+                tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
+                tallies[pid]['r_out'] = calculate_new_stock(tallies[pid]['r_out'], txn.quantity, eff_unit, is_adding=True)
+
+    # 4. Map to Result
     results = []
-    for r in pagination.items:
+    for p in products:
         results.append({
-            "product_id": r.product_id,
-            "product": r.product_name,
-            "sku": r.sku,
-            "total_in": float(r.total_in),
-            "total_out": float(r.total_out),
-            "return_in": float(r.return_in),
-            "return_out": float(r.return_out)
+            "product_id": p.id,
+            "product": p.name,
+            "sku": p.product_code,
+            "total_in": tallies[p.id]['t_in'],
+            "total_out": tallies[p.id]['t_out'],
+            "return_in": tallies[p.id]['r_in'],
+            "return_out": tallies[p.id]['r_out']
         })
 
     return jsonify({
         "data": results,
-        "pagination": {
-            "page": page,
-            "per_page": per_page,
-            "total": pagination.total,
-            "pages": pagination.pages
-        }
+        "pagination": { "page": page, "per_page": per_page, "total": pagination.total, "pages": pagination.pages }
     }), 200
-
 
 from flask import Response
 
@@ -1117,142 +1120,31 @@ from flask import Response
 @jwt_required
 def export_products_json():
     active_dept = get_active_department()
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
-
-    search_term = request.args.get('search', '').strip()
-    start_str = request.args.get('start_date')
-    end_str = request.args.get('end_date')
-    
-    # 👇 ADDED: Retrieve the checkbox filters from the URL
-    cat_ids = request.args.get('cats', '')
-    sub_ids = request.args.get('subs', '')
-
-    txn_query = db.session.query(
-        Transaction.product_id,
-        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
-        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept) # 👈 Department filter secured
-
-    is_custom_range = False
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
-            is_custom_range = True
-        except ValueError:
-            pass
-
-    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
-
-    query = db.session.query(
-        Product,
-        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
-        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
-    ).options(
-        joinedload(Product.category_rel),
-        joinedload(Product.sub_category_rel)
-    ).filter(
-        Product.department_id == active_dept,
-        Product.is_active == True
-    )
-
-    if is_custom_range:
-        query = query.join(txn_subq, Product.id == txn_subq.c.product_id)
-    else:
-        query = query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
-
-    # 👇 ADDED: Apply the Search Filter
-    if search_term:
-        query = query.filter(or_(
-            Product.name.ilike(f"%{search_term}%"),
-            Product.product_code.ilike(f"%{search_term}%")
-        ))
-
-    # 👇 ADDED: Apply the Category & Sub-Category Filters
-    if cat_ids:
-        cat_list = [int(x) for x in cat_ids.split(',')]
-        query = query.filter(Product.category_id.in_(cat_list))
-
-    if sub_ids:
-        sub_list = [int(x) for x in sub_ids.split(',')]
-        query = query.filter(Product.sub_category_id.in_(sub_list))
-
-    results = query.all()
-    
-    cso_records = CategorySubOrder.query.all()
-    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
-
-    groups = {}
-    cat_orders = {}
-    sub_orders = {}
-
-    for p, t_in, t_out in results:
-        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
-        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
-        
-        cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
-        if cat_name not in sub_orders: sub_orders[cat_name] = {}
-            
-        sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
-
-        if cat_name not in groups: groups[cat_name] = {}
-        if sub_name not in groups[cat_name]: groups[cat_name][sub_name] = []
-
-        current_stock = (t_in - t_out) if is_custom_range else p.current_stock
-
-        groups[cat_name][sub_name].append({
-            "code": p.product_code or '-',
-            "name": p.name or '-',
-            "in": int(t_in),
-            "out": int(t_out),
-            "stock": int(current_stock)
-        })
-
-    export_data = []
-    sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
-    
-    for cat_name in sorted_cats:
-        export_data.append({"type": "category", "title": f"{cat_name} Category"})
-        sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders[cat_name].get(s, 9999), s))
-        
-        for sub_name in sorted_subs:
-            export_data.append({"type": "subcategory", "title": sub_name})
-            items = sorted(groups[cat_name][sub_name], key=lambda x: str(x['code']).upper())
-            for item in items:
-                export_data.append({
-                    "type": "item", "code": item['code'], "name": item['name'], 
-                    "in": item['in'], "out": item['out'], "stock": item['stock']
-                })
-
-    return jsonify(export_data), 200
-
-
-@core.route('/products/export/csv', methods=['GET'])
-@jwt_required
-def export_products_csv():
-    active_dept = get_active_department()
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
-
     search_term = request.args.get('search', '').strip()
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
     cat_ids = request.args.get('cats', '') 
     sub_ids = request.args.get('subs', '')
 
-    # 👇 UPDATED: CSV now uses the exact same time-bound transaction math as the UI!
-    txn_query = db.session.query(
-        Transaction.product_id,
-        func.sum(case(((Transaction.type == 'in'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id == None), Transaction.quantity), else_=0)).label('t_in'),
-        func.sum(case(((Transaction.type == 'out'), Transaction.quantity),
-                      (and_(Transaction.type == 'return', Transaction.supplier_id != None), Transaction.quantity), else_=0)).label('t_out')
-    ).filter(Transaction.is_active == True, Transaction.department_id == active_dept)
+    product_query = Product.query.options(
+        joinedload(Product.category_rel),
+        joinedload(Product.sub_category_rel)
+    ).filter(Product.department_id == active_dept, Product.is_active == True)
 
+    if search_term:
+        product_query = product_query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
+    if cat_ids:
+        product_query = product_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
+    if sub_ids:
+        product_query = product_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
+
+    products = product_query.all()
+    if not products: return jsonify([]), 200
+
+    product_map = {p.id: p for p in products}
+    product_ids = list(product_map.keys())
+
+    txn_query = Transaction.query.filter(Transaction.is_active == True, Transaction.department_id == active_dept, Transaction.product_id.in_(product_ids))
     is_custom_range = False
     if start_str and end_str:
         try:
@@ -1260,82 +1152,127 @@ def export_products_csv():
             end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
             txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
             is_custom_range = True
-        except ValueError:
-            pass
+        except ValueError: pass
 
-    txn_subq = txn_query.group_by(Transaction.product_id).subquery()
+    transactions = txn_query.all()
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'has_activity': False} for pid in product_ids}
 
-    query = db.session.query(
-        Product,
-        func.coalesce(txn_subq.c.t_in, 0).label('total_in'),
-        func.coalesce(txn_subq.c.t_out, 0).label('total_out')
-    ).options(
-        joinedload(Product.category_rel),
-        joinedload(Product.sub_category_rel)
-    ).filter(
-        Product.department_id == active_dept,
-        Product.is_active == True
-    )
+    for txn in transactions:
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+        tallies[pid]['has_activity'] = True
 
-    if is_custom_range:
-        query = query.join(txn_subq, Product.id == txn_subq.c.product_id)
-    else:
-        query = query.outerjoin(txn_subq, Product.id == txn_subq.c.product_id)
+        if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
 
-    # 👇 ADDED: Search Filter
-    if search_term:
-        query = query.filter(or_(
-            Product.name.ilike(f"%{search_term}%"),
-            Product.product_code.ilike(f"%{search_term}%")
-        ))
+    cso_records = CategorySubOrder.query.all()
+    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
+    groups, cat_orders, sub_orders = {}, {}, {}
 
-    # 👇 ADDED: Category Filters
-    if cat_ids:
-        cat_list = [int(x) for x in cat_ids.split(',')]
-        query = query.filter(Product.category_id.in_(cat_list))
+    for p in products:
+        if is_custom_range and not tallies[p.id]['has_activity']: continue
+        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
+        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
+        cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
+        if cat_name not in sub_orders: sub_orders[cat_name] = {}
+        sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
+        if cat_name not in groups: groups[cat_name] = {}
+        if sub_name not in groups[cat_name]: groups[cat_name][sub_name] = []
 
-    if sub_ids:
-        sub_list = [int(x) for x in sub_ids.split(',')]
-        query = query.filter(Product.sub_category_id.in_(sub_list))
+        eff_unit = get_effective_unit(p)
+        current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
 
-    results = query.all()
-    
-    # Pull dynamic sorting data
+        groups[cat_name][sub_name].append({
+            "code": p.product_code or '-', "name": p.name or '-',
+            "in": tallies[p.id]['t_in'], "out": tallies[p.id]['t_out'], "stock": current_stock
+        })
+
+    export_data = []
+    sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
+    for cat_name in sorted_cats:
+        export_data.append({"type": "category", "title": f"{cat_name} Category"})
+        sorted_subs = sorted(groups[cat_name].keys(), key=lambda s: (sub_orders[cat_name].get(s, 9999), s))
+        for sub_name in sorted_subs:
+            export_data.append({"type": "subcategory", "title": sub_name})
+            for item in sorted(groups[cat_name][sub_name], key=lambda x: str(x['code']).upper()):
+                export_data.append({"type": "item", **item})
+
+    return jsonify(export_data), 200
+
+@core.route('/products/export/csv', methods=['GET'])
+@jwt_required
+def export_products_csv():
+    active_dept = get_active_department()
+    search_term = request.args.get('search', '').strip()
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+    cat_ids = request.args.get('cats', '') 
+    sub_ids = request.args.get('subs', '')
+
+    product_query = Product.query.options(joinedload(Product.category_rel), joinedload(Product.sub_category_rel)).filter(Product.department_id == active_dept, Product.is_active == True)
+
+    if search_term: product_query = product_query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
+    if cat_ids: product_query = product_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
+    if sub_ids: product_query = product_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
+
+    products = product_query.all()
+    if not products: return Response("Category,Subcategory,Product Code,Product Name,In,Out,Stock\n", mimetype="text/csv")
+
+    product_map = {p.id: p for p in products}
+    product_ids = list(product_map.keys())
+
+    txn_query = Transaction.query.filter(Transaction.is_active == True, Transaction.department_id == active_dept, Transaction.product_id.in_(product_ids))
+    is_custom_range = False
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+            is_custom_range = True
+        except ValueError: pass
+
+    transactions = txn_query.all()
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'has_activity': False} for pid in product_ids}
+
+    for txn in transactions:
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+        tallies[pid]['has_activity'] = True
+
+        if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
+
     cso_records = CategorySubOrder.query.all()
     cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
 
-    def get_sort_keys(row):
-        p, t_in, t_out = row
+    def get_sort_keys(p):
         cat_order = p.category_rel.display_order if p.category_rel else 9999
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         sub_order = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
         return (cat_order, cat_name, sub_order, sub_name, p.product_code or '')
 
-    results.sort(key=get_sort_keys)
-
+    products.sort(key=get_sort_keys)
     output = io.StringIO()
     writer = csv.writer(output)
-    
     writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Stock'])
 
-    for p, t_in, t_out in results:
-        current_stock = (t_in - t_out) if is_custom_range else p.current_stock
+    for p in products:
+        if is_custom_range and not tallies[p.id]['has_activity']: continue
+        eff_unit = get_effective_unit(p)
+        current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
+        
         writer.writerow([
             p.category_rel.name if p.category_rel else 'OTHER',
             p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
-            p.product_code,
-            p.name,
-            int(t_in),
-            int(t_out),
-            int(current_stock)
+            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], current_stock
         ])
 
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment;filename=inventory_report.csv"}
-    )
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
 
 import csv
 import io
@@ -2673,52 +2610,46 @@ def get_contractor_stock(id):
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
 
-    query = db.session.query(
-        Product.id,
-        Product.name,
-        Product.product_code,
-        Product.unit,
-        Product.department_id, 
-        Transaction.challan_id,
-        func.max(Transaction.created_at).label('last_date'), # 👈 GET THE DATE
-        func.sum(case(
-            (Transaction.type == 'out', Transaction.quantity), 
-            (Transaction.type == 'return', -Transaction.quantity),
-            else_=0
-        )).label('net_qty')
-    ).join(Transaction)\
-     .filter(
-         Transaction.contractor_id == id, 
-         Transaction.is_active == True
-     )
-
+    txn_query = Transaction.query.filter(Transaction.contractor_id == id, Transaction.is_active == True)
     if start_date and end_date:
-        query = query.filter(
-            func.date(Transaction.created_at) >= start_date, # 👈 Fixed to created_at
-            func.date(Transaction.created_at) <= end_date
-        )
+        try:
+            sd = datetime.strptime(start_date, '%Y-%m-%d')
+            ed = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(sd, ed))
+        except ValueError: pass
 
-    results = query.group_by(
-        Product.id, Product.name, Product.product_code, Product.unit, Product.department_id, Transaction.challan_id
-    ).having(func.sum(case(
-            (Transaction.type == 'out', Transaction.quantity),
-            (Transaction.type == 'return', -Transaction.quantity),
-            else_=0
-        )) > 0)\
-     .all()
+    transactions = txn_query.options(joinedload(Transaction.product)).all()
+    
+    # Tally grouped by (product_id, challan_id)
+    tallies = {}
+    for txn in transactions:
+        p = txn.product
+        if not p or not p.is_active: continue
+        
+        eff_unit = get_effective_unit(p)
+        key = (p.id, txn.challan_id)
+        
+        if key not in tallies:
+            tallies[key] = {
+                "product_id": p.id, "product_name": p.name, "sku": p.product_code, "unit": eff_unit,
+                "department_id": p.department_id, "challan_id": txn.challan_id, "last_date": txn.created_at, "qty": 0.0
+            }
+            
+        if txn.created_at > tallies[key]["last_date"]:
+            tallies[key]["last_date"] = txn.created_at
+            
+        if txn.type == 'out':
+            tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, True)
+        elif txn.type == 'return':
+            tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, False)
 
     stock_list = []
-    for r in results:
-        stock_list.append({
-            "product_id": r.id,
-            "product_name": r.name,
-            "sku": r.product_code,
-            "unit": r.unit,
-            "qty": r.net_qty,
-            "challan_id": r.challan_id,
-            "date": r.last_date.strftime('%Y-%m-%d') if r.last_date else "", # 👈 Send Date to frontend
-            "department_id": r.department_id 
-        })
+    for key, data in tallies.items():
+        if data['qty'] > 0:
+            data['date'] = data['last_date'].strftime('%Y-%m-%d')
+            del data['last_date']
+            stock_list.append(data)
+
     return jsonify(stock_list), 200
 
 # @core.route("/suppliers/<int:id>/products", methods=["GET"])
@@ -2776,59 +2707,48 @@ def get_supplier_products(id):
     try:
         product_id = request.args.get('product_id')
 
-        # --- MODE 1: Drill Down (Transaction History) ---
+        # --- MODE 1: Drill Down ---
         if product_id:
             transactions = Transaction.query.options(
-                joinedload(Transaction.product),
-                joinedload(Transaction.supplier),
-                joinedload(Transaction.contractor)
+                joinedload(Transaction.product), joinedload(Transaction.supplier), joinedload(Transaction.contractor)
             ).filter(
-                Transaction.supplier_id == id,
-                Transaction.product_id == product_id,
+                Transaction.supplier_id == id, Transaction.product_id == product_id,
                 func.lower(Transaction.type).in_(['in', 'return'])
             ).order_by(Transaction.created_at.desc()).all()
-
             return jsonify([t.to_dict() for t in transactions]), 200
 
-        # --- MODE 2: Consolidated View (Main Table) ---
-        results = db.session.query(
-            Product.id,
-            Product.name,
-            Product.product_code,
-            # Removed Product.current_stock from here
-            func.sum(
-                db.case(
-                    (func.lower(Transaction.type) == 'in', Transaction.quantity),
-                    (func.lower(Transaction.type) == 'return', -Transaction.quantity),
-                    else_=0
-                )
-            ).label('total_supplied'),
-            func.max(Transaction.created_at).label('last_supplied')
-        ).join(Transaction, Transaction.product_id == Product.id)\
-         .filter(
-             Transaction.supplier_id == id,
-             func.lower(Transaction.type).in_(['in', 'return'])
-         )\
-         .group_by(Product.id, Product.name, Product.product_code)\
-         .all() # Removed Product.current_stock from group_by
+        # --- MODE 2: Consolidated View ---
+        transactions = Transaction.query.options(joinedload(Transaction.product)).filter(
+            Transaction.supplier_id == id, func.lower(Transaction.type).in_(['in', 'return'])
+        ).all()
+
+        tallies = {}
+        for txn in transactions:
+            p = txn.product
+            if not p: continue
+            
+            eff_unit = get_effective_unit(p)
+            if p.id not in tallies:
+                tallies[p.id] = {
+                    "id": p.id, "name": p.name, "sku": p.product_code, "total_supplied": 0.0, "last_supplied": txn.created_at
+                }
+                
+            if txn.created_at > tallies[p.id]["last_supplied"]:
+                tallies[p.id]["last_supplied"] = txn.created_at
+
+            if txn.type == 'in':
+                tallies[p.id]['total_supplied'] = calculate_new_stock(tallies[p.id]['total_supplied'], txn.quantity, eff_unit, True)
+            elif txn.type == 'return':
+                tallies[p.id]['total_supplied'] = calculate_new_stock(tallies[p.id]['total_supplied'], txn.quantity, eff_unit, False)
 
         data = []
-        for r in results:
-            data.append({
-                "id": r.id,
-                "name": r.name,
-                "sku": r.product_code,
-                # Removed current_stock from the response
-                "total_supplied": float(r.total_supplied or 0), 
-                "last_supplied": r.last_supplied.strftime('%Y-%m-%d') if r.last_supplied else "N/A"
-            })
+        for pid, item in tallies.items():
+            item["last_supplied"] = item["last_supplied"].strftime('%Y-%m-%d')
+            data.append(item)
 
         return jsonify(data), 200
-
     except Exception as e:
-        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @core.route('/products/<int:id>/transactions', methods=['GET'])
 @jwt_required
