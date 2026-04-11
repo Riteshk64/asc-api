@@ -670,7 +670,7 @@ def get_user_attendance_history(id):
 
 #     return jsonify([p.to_dict() for p in products]), 200
 
-from sqlalchemy.orm import joinedload
+
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -687,7 +687,7 @@ def get_products():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    # 1. Fetch Filtered Products First
+    # 1. Fetch Filtered Products
     base_query = db.session.query(Product).options(
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
@@ -701,8 +701,10 @@ def get_products():
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
+
     if cat_ids:
         base_query = base_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
+
     if sub_ids:
         base_query = base_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
 
@@ -759,8 +761,16 @@ def get_products():
 
     return jsonify({
         "data": data,
-        "pagination": { "page": page, "per_page": per_page, "total": pagination.total, "pages": pagination.pages }
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": pagination.total,
+            "pages": pagination.pages
+        }
     }), 200
+
+
+
 @core.route('/products/search', methods=['GET'])
 @jwt_required
 def search_products():
@@ -1034,7 +1044,6 @@ def get_transactions():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    # 1. Fetch Filtered Products First
     query = Product.query.filter_by(is_active=True, department_id=active_dept)
     if search_term:
         query = query.filter(or_(
@@ -1051,7 +1060,6 @@ def get_transactions():
     product_ids = [p.id for p in products]
     product_map = {p.id: p for p in products}
 
-    # 2. Fetch Transactions for ONLY the paginated products
     txn_query = Transaction.query.filter(
         Transaction.is_active == True,
         Transaction.department_id == active_dept,
@@ -1068,7 +1076,6 @@ def get_transactions():
 
     transactions = txn_query.all()
 
-    # 3. Python Math Tally (Fixes the 3.2 issue)
     tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'r_in': 0.0, 'r_out': 0.0} for pid in product_ids}
 
     for txn in transactions:
@@ -1087,7 +1094,6 @@ def get_transactions():
                 tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
                 tallies[pid]['r_out'] = calculate_new_stock(tallies[pid]['r_out'], txn.quantity, eff_unit, is_adding=True)
 
-    # 4. Map to Result
     results = []
     for p in products:
         results.append({
@@ -1116,10 +1122,14 @@ import csv
 import io
 from flask import Response
 
+
 @core.route('/products/export/json', methods=['GET'])
 @jwt_required
 def export_products_json():
     active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
     search_term = request.args.get('search', '').strip()
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
@@ -1274,6 +1284,79 @@ def export_products_csv():
 
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
 
+
+@core.route('/products/export/csv', methods=['GET'])
+@jwt_required
+def export_products_csv():
+    active_dept = get_active_department()
+    search_term = request.args.get('search', '').strip()
+    start_str = request.args.get('start_date')
+    end_str = request.args.get('end_date')
+    cat_ids = request.args.get('cats', '') 
+    sub_ids = request.args.get('subs', '')
+
+    product_query = Product.query.options(joinedload(Product.category_rel), joinedload(Product.sub_category_rel)).filter(Product.department_id == active_dept, Product.is_active == True)
+
+    if search_term: product_query = product_query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
+    if cat_ids: product_query = product_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
+    if sub_ids: product_query = product_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
+
+    products = product_query.all()
+    if not products: return Response("Category,Subcategory,Product Code,Product Name,In,Out,Stock\n", mimetype="text/csv")
+
+    product_map = {p.id: p for p in products}
+    product_ids = list(product_map.keys())
+
+    txn_query = Transaction.query.filter(Transaction.is_active == True, Transaction.department_id == active_dept, Transaction.product_id.in_(product_ids))
+    is_custom_range = False
+    if start_str and end_str:
+        try:
+            start_date = datetime.strptime(start_str, '%Y-%m-%d')
+            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+            is_custom_range = True
+        except ValueError: pass
+
+    transactions = txn_query.all()
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'has_activity': False} for pid in product_ids}
+
+    for txn in transactions:
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+        tallies[pid]['has_activity'] = True
+
+        if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
+
+    cso_records = CategorySubOrder.query.all()
+    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
+
+    def get_sort_keys(p):
+        cat_order = p.category_rel.display_order if p.category_rel else 9999
+        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
+        sub_order = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
+        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
+        return (cat_order, cat_name, sub_order, sub_name, p.product_code or '')
+
+    products.sort(key=get_sort_keys)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Stock'])
+
+    for p in products:
+        if is_custom_range and not tallies[p.id]['has_activity']: continue
+        eff_unit = get_effective_unit(p)
+        current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
+        
+        writer.writerow([
+            p.category_rel.name if p.category_rel else 'OTHER',
+            p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
+            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], current_stock
+        ])
+
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
 import csv
 import io
 from flask import Response
@@ -1288,6 +1371,7 @@ import io
 from sqlalchemy import func, case, and_, or_
 from sqlalchemy.orm import joinedload
 
+
 @core.route('/transactions/export/csv', methods=['GET'])
 @jwt_required
 def export_transactions_csv():
@@ -1296,63 +1380,61 @@ def export_transactions_csv():
     search_term = request.args.get('search', '').strip()
     active_dept = get_active_department()
 
-    # 1. Base transaction query (Same as your UI)
-    base_txn = db.session.query(Transaction).filter(Transaction.is_active == True)
+    txn_query = Transaction.query.filter(Transaction.is_active == True)
+    if active_dept:
+        txn_query = txn_query.filter(Transaction.department_id == active_dept)
+        
     if start_str and end_str:
         try:
             start_date = datetime.strptime(start_str, '%Y-%m-%d')
             end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            base_txn = base_txn.filter(Transaction.created_at.between(start_date, end_date))
-        except ValueError:
-            pass
-    txn_subq = base_txn.subquery()
+            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
+        except ValueError: pass
 
-    # 2. Group by Product and sum (Same as your UI)
-    query = db.session.query(
-        Product.name.label('product_name'),
-        Product.product_code.label('sku'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'in'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('total_in'),
-        func.coalesce(func.sum(case(((txn_subq.c.type == 'out'), txn_subq.c.quantity),
-                      (and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('total_out'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id == None), txn_subq.c.quantity), else_=0)), 0).label('return_in'),
-        func.coalesce(func.sum(case((and_(txn_subq.c.type == 'return', txn_subq.c.supplier_id != None), txn_subq.c.quantity), else_=0)), 0).label('return_out')
-    ).join(txn_subq, Product.id == txn_subq.c.product_id).filter(Product.is_active == True)
-
-    if active_dept:
-        query = query.filter(Product.department_id == active_dept)
-    if search_term:
-        query = query.filter(or_(
-            Product.name.ilike(f"%{search_term}%"),
-            Product.product_code.ilike(f"%{search_term}%")
-        ))
-
-    query = query.group_by(Product.id, Product.name, Product.product_code)
+    transactions = txn_query.all()
+    product_ids = list(set([t.product_id for t in transactions]))
     
-    # 3. Fetch ALL results (No pagination)
-    results = query.order_by(Product.name.asc()).all()
+    product_query = Product.query.filter(Product.is_active == True, Product.id.in_(product_ids))
+    if search_term:
+        product_query = product_query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
+        
+    products = product_query.all()
+    product_map = {p.id: p for p in products}
 
-    # 4. Generate CSV
+    tallies = {p.id: {'tot_in': 0.0, 'ret_in': 0.0, 'tot_out': 0.0, 'ret_out': 0.0} for p in products}
+
+    for txn in transactions:
+        if txn.product_id not in product_map: continue
+        pid = txn.product_id
+        eff_unit = get_effective_unit(product_map[pid])
+
+        if txn.type == 'in':
+            tallies[pid]['tot_in'] = calculate_new_stock(tallies[pid]['tot_in'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'out':
+            tallies[pid]['tot_out'] = calculate_new_stock(tallies[pid]['tot_out'], txn.quantity, eff_unit, is_adding=True)
+        elif txn.type == 'return':
+            if not txn.supplier_id: 
+                tallies[pid]['tot_in'] = calculate_new_stock(tallies[pid]['tot_in'], txn.quantity, eff_unit, is_adding=True)
+                tallies[pid]['ret_in'] = calculate_new_stock(tallies[pid]['ret_in'], txn.quantity, eff_unit, is_adding=True)
+            else:
+                tallies[pid]['tot_out'] = calculate_new_stock(tallies[pid]['tot_out'], txn.quantity, eff_unit, is_adding=True)
+                tallies[pid]['ret_out'] = calculate_new_stock(tallies[pid]['ret_out'], txn.quantity, eff_unit, is_adding=True)
+
+    sorted_products = sorted(products, key=lambda p: p.name.lower())
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['Product Name', 'SKU', 'Total In', 'Returns In', 'Total Out', 'Returns Out'])
 
-    for r in results:
+    for p in sorted_products:
         writer.writerow([
-            r.product_name, 
-            r.sku or '-', 
-            float(r.total_in), 
-            float(r.return_in), 
-            float(r.total_out), 
-            float(r.return_out)
+            p.name, p.product_code or '-', 
+            tallies[p.id]['tot_in'], tallies[p.id]['ret_in'], 
+            tallies[p.id]['tot_out'], tallies[p.id]['ret_out']
         ])
 
     output.seek(0)
-    return Response(
-        output, 
-        mimetype="text/csv", 
-        headers={"Content-Disposition": "attachment;filename=Transaction_History.csv"}
-    )
+    return Response(output, mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=Transaction_History.csv"})
 
 
 @core.route('/transactions/<int:id>', methods=['PUT'])
@@ -1375,16 +1457,19 @@ def update_transaction(id):
 
     product = txn.product
     old_qty = txn.quantity
-    diff = new_qty - old_qty
 
-    if diff == 0:
+    if old_qty == new_qty:
         return jsonify({"message": "No change detected"}), 200
 
-    # 👇 ALLOW NEGATIVE STOCK
-    if txn.type == 'in' or txn.type == 'return':
-        product.current_stock += diff
-    elif txn.type == 'out':
-        product.current_stock -= diff
+    eff_unit = get_effective_unit(product)
+
+    # 👇 Rollback old quantity, apply new quantity using base-12 helper
+    if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+        product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=False)
+        product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=True)
+    elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+        product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=True)
+        product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=False)
 
     txn.quantity = new_qty
     
@@ -1406,7 +1491,6 @@ def update_transaction(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 @core.route('/recycle-bin', methods=['GET'])
 @jwt_required
 @admin_only
@@ -1459,7 +1543,6 @@ def get_recycle_bin():
         "sub_categories": [s.to_dict() for s in sub_categories] # 👈
     }), 200
     
-
 @core.route('/recycle-bin/<string:type>/<int:id>/restore', methods=['PUT'])
 @jwt_required
 @admin_only
@@ -1475,11 +1558,11 @@ def restore_any_entity(type, id):
             txns = Transaction.query.filter_by(supplier_id=id, is_active=False).all()
             for txn in txns:
                 if txn.product and txn.product.is_active:
-                    # 👇 ALLOW NEGATIVE STOCK
+                    eff_unit = get_effective_unit(txn.product)
                     if txn.type == 'in':
-                        txn.product.current_stock += txn.quantity 
+                        txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=True)
                     elif txn.type == 'return':
-                        txn.product.current_stock -= txn.quantity 
+                        txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=False)
                 
                 txn.is_active = True
                 db.session.add(txn)
@@ -1497,11 +1580,11 @@ def restore_any_entity(type, id):
             txns = Transaction.query.filter_by(contractor_id=id, is_active=False).all()
             for txn in txns:
                 if txn.product and txn.product.is_active:
-                    # 👇 ALLOW NEGATIVE STOCK
+                    eff_unit = get_effective_unit(txn.product)
                     if txn.type == 'out':
-                        txn.product.current_stock -= txn.quantity 
+                        txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=False)
                     elif txn.type == 'return':
-                        txn.product.current_stock += txn.quantity 
+                        txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=True)
                 
                 txn.is_active = True
                 db.session.add(txn)
@@ -1527,16 +1610,18 @@ def restore_any_entity(type, id):
             if not product or not product.is_active:
                 return jsonify({"error": "Cannot restore: Parent Product is deleted"}), 400
 
-            # 👇 ALLOW NEGATIVE STOCK
+            eff_unit = get_effective_unit(product)
+
+            # 👇 Roll forward to restore safely handling gross units
             if txn.type == 'in':
-                product.current_stock += txn.quantity
+                product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=True)
             elif txn.type == 'out':
-                product.current_stock -= txn.quantity
+                product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=False)
             elif txn.type == 'return':
                 if txn.supplier_id:
-                    product.current_stock -= txn.quantity
+                    product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=False)
                 else:
-                    product.current_stock += txn.quantity
+                    product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=True)
 
             txn.is_active = True
             db.session.add(txn)
@@ -1571,6 +1656,7 @@ def restore_any_entity(type, id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+
 @core.route('/transactions/<int:id>', methods=['DELETE'])
 @jwt_required
 def delete_transaction(id):
@@ -1583,17 +1669,18 @@ def delete_transaction(id):
          return jsonify({"error": "Unauthorized to delete this transaction"}), 403
 
     product = txn.product
+    eff_unit = get_effective_unit(product)
 
-    # 👇 ALLOW NEGATIVE STOCK
+    # 👇 Reverse the transaction using the helper
     if txn.type == 'in':
-        product.current_stock -= txn.quantity
+        product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=False)
     elif txn.type == 'out':
-        product.current_stock += txn.quantity
+        product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=True)
     elif txn.type == 'return':
         if txn.supplier_id:
-            product.current_stock += txn.quantity
+            product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=True)
         else:
-            product.current_stock -= txn.quantity
+            product.current_stock = calculate_new_stock(product.current_stock, txn.quantity, eff_unit, is_adding=False)
 
     txn.is_active = False
 
@@ -1615,7 +1702,6 @@ def delete_transaction(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
-
 @core.route('/recycle-bin/<string:type>/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
@@ -2534,19 +2620,21 @@ def delete_suppliers(id):
     
     supplier.is_active = False
 
-    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock
+    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock safely
     txns = Transaction.query.filter_by(supplier_id=id, is_active=True).all()
     for txn in txns:
         txn.is_active = False
         if txn.product:
+            eff_unit = get_effective_unit(txn.product)
             if txn.type == 'in':
-                if txn.product.current_stock >= txn.quantity:
-                    txn.product.current_stock -= txn.quantity
-                else:
+                new_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=False)
+                if new_stock < 0:
                     txn.product.current_stock = 0
                     txn.product.is_active = False # Auto-trash product if stock corruption occurs
+                else:
+                    txn.product.current_stock = new_stock
             elif txn.type == 'return':
-                txn.product.current_stock += txn.quantity
+                txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=True)
         
         log = ActivityLog(
             user_id=g.current_user.id if hasattr(g, 'current_user') else None, 
@@ -2561,7 +2649,8 @@ def delete_suppliers(id):
     except Exception as e: 
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-  
+
+
 @core.route('/contractors/<int:id>', methods=['DELETE'])
 @jwt_required
 @admin_only
@@ -2576,18 +2665,20 @@ def delete_contractor(id):
     
     contractor.is_active = False
 
-    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock
+    # 👇 CASCADE SOFT-DELETE: Remove associated transactions & reverse stock safely
     txns = Transaction.query.filter_by(contractor_id=id, is_active=True).all()
     for txn in txns:
         txn.is_active = False
         if txn.product:
+            eff_unit = get_effective_unit(txn.product)
             if txn.type == 'out':
-                txn.product.current_stock += txn.quantity
+                txn.product.current_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=True)
             elif txn.type == 'return':
-                if txn.product.current_stock >= txn.quantity:
-                    txn.product.current_stock -= txn.quantity
-                else:
+                new_stock = calculate_new_stock(txn.product.current_stock, txn.quantity, eff_unit, is_adding=False)
+                if new_stock < 0:
                     txn.product.current_stock = 0
+                else:
+                    txn.product.current_stock = new_stock
         
         log = ActivityLog(
             user_id=g.current_user.id if hasattr(g, 'current_user') else None, 
@@ -2620,7 +2711,6 @@ def get_contractor_stock(id):
 
     transactions = txn_query.options(joinedload(Transaction.product)).all()
     
-    # Tally grouped by (product_id, challan_id)
     tallies = {}
     for txn in transactions:
         p = txn.product
