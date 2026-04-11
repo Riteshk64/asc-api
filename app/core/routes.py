@@ -24,6 +24,51 @@ from app.models.categorysuborder import CategorySubOrder
 core = Blueprint('core', __name__, url_prefix='/core')
 
 
+def get_effective_unit(product):
+    """
+    Strictly checks the Department's unit. Completely ignores the Product's unit.
+    """
+    if product.department_id:
+        dept = Department.query.get(product.department_id)
+        if dept and dept.unit:
+            return str(dept.unit).strip().lower()
+            
+    return 'pcs' 
+
+def calculate_new_stock(current_stock, amount, unit, is_adding=True):
+    """
+    Calculates stock. If unit is 'gross', treats decimals as base-12 dozens.
+    Example: 0.8 + 0.4 = 1.0 (1 gross, 0 dozen)
+    """
+    if not is_adding:
+        amount = -amount
+        
+    safe_unit = str(unit).strip().lower() if unit else 'pcs'
+    
+    if safe_unit == 'gross':
+        def to_dozens(val):
+            sign = -1 if val < 0 else 1
+            val = abs(val)
+            gross = int(val)
+            # Rounding fixes Python float precision quirks (e.g. 0.80000001)
+            dozens = round((val - gross) * 10) 
+            return sign * (gross * 12 + dozens)
+            
+        total_dozens = to_dozens(current_stock) + to_dozens(amount)
+        
+        sign = -1 if total_dozens < 0 else 1
+        total_dozens = abs(total_dozens)
+        
+        new_gross = total_dozens // 12
+        new_dozens = total_dozens % 12
+        
+        # Convert back to decimal format (e.g., 1 gross, 4 dozen -> 1.4)
+        return sign * (new_gross + (new_dozens / 10.0))
+    
+    # Standard base-10 math for 'pcs', 'kg', etc.
+    return current_stock + amount
+
+
 def get_active_department():
     # Admins can "impersonate" departments via headers
     if g.role == "ADMIN":
@@ -35,7 +80,6 @@ def get_active_department():
             
     # ✅ Workers always use their latest database-assigned department
     return g.current_user.department_id
-
 
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
@@ -84,10 +128,12 @@ def stock_operation():
     supplier_id = data.get('supplier_id')
     contractor_id = data.get('contractor_id')
 
+    eff_unit = get_effective_unit(product)
+
     if op_type == 'in':
         sup_name = data.get('supplier_name', '').strip()
         if not sup_name and not supplier_id: return jsonify({"error": "Supplier Name required."}), 400
-        product.current_stock += qty
+        product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
         if not supplier_id:
             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
             if not supplier:
@@ -99,8 +145,7 @@ def stock_operation():
     elif op_type == 'out':
         cont_name = data.get('contractor_name', '').strip()
         if not cont_name and not contractor_id: return jsonify({"error": "Contractor Name required."}), 400
-        # 👇 ALLOW NEGATIVE STOCK (Gatekeeper Removed)
-        product.current_stock -= qty
+        product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
         if not contractor_id:
             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
             if not contractor:
@@ -116,8 +161,7 @@ def stock_operation():
              return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
         
         if sup_name or supplier_id:
-            # 👇 ALLOW NEGATIVE STOCK (Gatekeeper Removed)
-            product.current_stock -= qty
+            product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
             if not supplier_id:
                 supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
                 if not supplier:
@@ -126,7 +170,7 @@ def stock_operation():
                     db.session.flush()
                 supplier_id = supplier.id
         elif cont_name or contractor_id:
-            product.current_stock += qty  
+            product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)  
             if not contractor_id:
                 contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
                 if not contractor:
@@ -151,8 +195,6 @@ def stock_operation():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
-
 
 @core.route('/stock/operate/bulk', methods=['POST'])
 @jwt_required
@@ -229,16 +271,17 @@ def bulk_stock_operation():
             if not product or (product.department_id != active_dept and g.role != 'ADMIN'):
                 raise Exception(f"Invalid or unauthorized product ID: {prod_id}")
 
-            # 👇 ALLOW NEGATIVE STOCK (Gatekeepers Removed)
+            eff_unit = get_effective_unit(product)
+
             if op_type == 'in':
-                product.current_stock += qty
+                product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
             elif op_type == 'out':
-                product.current_stock -= qty
+                product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
             elif op_type == 'return':
                 if supplier_name:
-                    product.current_stock -= qty
+                    product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
                 elif contractor_name:
-                    product.current_stock += qty
+                    product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
 
             txn = Transaction(
                 product_id=product.id, type=op_type, quantity=qty,
@@ -2878,12 +2921,15 @@ def get_product_transactions(id):
         "data": results,
         "pagination": { "page": page, "per_page": per_page, "total": paginated.total, "pages": paginated.pages }
     }), 200   
+
+
+
+
 @core.route('/stock/recalibrate', methods=['POST'])
 @jwt_required
 def recalibrate_stock():
     active_dept = get_active_department()
     
-    # Base query for active products
     query = Product.query.filter_by(is_active=True)
     if active_dept:
         query = query.filter_by(department_id=active_dept)
@@ -2892,39 +2938,23 @@ def recalibrate_stock():
     mismatch_count = 0
     
     for product in products:
-        # 1. Sum all additions: "in" OR "return" from a contractor (supplier_id is None)
-        additions = db.session.query(func.coalesce(func.sum(Transaction.quantity), 0)).filter(
-            Transaction.product_id == product.id,
-            Transaction.is_active == True,
-            or_(
-                Transaction.type == 'in',
-                and_(Transaction.type == 'return', Transaction.supplier_id == None)
-            )
-        ).scalar()
-
-        # 2. Sum all deductions: "out" OR "return" to a supplier (supplier_id is NOT None)
-        deductions = db.session.query(func.coalesce(func.sum(Transaction.quantity), 0)).filter(
-            Transaction.product_id == product.id,
-            Transaction.is_active == True,
-            or_(
-                Transaction.type == 'out',
-                and_(Transaction.type == 'return', Transaction.supplier_id != None)
-            )
-        ).scalar()
-
-        # 3. Compare and update
-        expected_stock = additions - deductions
+        eff_unit = get_effective_unit(product)
+        txns = Transaction.query.filter_by(product_id=product.id, is_active=True).all()
         
-        if product.current_stock != expected_stock:
-            product.current_stock = expected_stock
+        # Calculate from zero using our Python helper
+        calculated_stock = 0.0
+        for txn in txns:
+            if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+                calculated_stock = calculate_new_stock(calculated_stock, txn.quantity, eff_unit, is_adding=True)
+            elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+                calculated_stock = calculate_new_stock(calculated_stock, txn.quantity, eff_unit, is_adding=False)
+        
+        # Use abs() to handle tiny float variations (e.g. 1.2000001 != 1.2)
+        if abs(product.current_stock - calculated_stock) > 0.001:
+            product.current_stock = calculated_stock
             mismatch_count += 1
             
-            # Optional: Log the recalibration activity
-            log = ActivityLog(
-                user_id=g.current_user.id,
-                # 👇 Shortened the text to stay safely under 50 characters
-                action=f"Fixed Prod #{product.id} stock to {expected_stock}" 
-            )
+            log = ActivityLog(user_id=g.current_user.id, action=f"Fixed Prod #{product.id} stock to {calculated_stock}"[:50])
             db.session.add(log)
             
     try:
@@ -2932,4 +2962,4 @@ def recalibrate_stock():
         return jsonify({"message": f"System recalibrated. {mismatch_count} product(s) fixed."}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500    
+        return jsonify({"error": str(e)}), 500
