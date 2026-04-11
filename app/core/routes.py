@@ -1211,78 +1211,6 @@ def export_products_json():
 
     return jsonify(export_data), 200
 
-@core.route('/products/export/csv', methods=['GET'])
-@jwt_required
-def export_products_csv():
-    active_dept = get_active_department()
-    search_term = request.args.get('search', '').strip()
-    start_str = request.args.get('start_date')
-    end_str = request.args.get('end_date')
-    cat_ids = request.args.get('cats', '') 
-    sub_ids = request.args.get('subs', '')
-
-    product_query = Product.query.options(joinedload(Product.category_rel), joinedload(Product.sub_category_rel)).filter(Product.department_id == active_dept, Product.is_active == True)
-
-    if search_term: product_query = product_query.filter(or_(Product.name.ilike(f"%{search_term}%"), Product.product_code.ilike(f"%{search_term}%")))
-    if cat_ids: product_query = product_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
-    if sub_ids: product_query = product_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
-
-    products = product_query.all()
-    if not products: return Response("Category,Subcategory,Product Code,Product Name,In,Out,Stock\n", mimetype="text/csv")
-
-    product_map = {p.id: p for p in products}
-    product_ids = list(product_map.keys())
-
-    txn_query = Transaction.query.filter(Transaction.is_active == True, Transaction.department_id == active_dept, Transaction.product_id.in_(product_ids))
-    is_custom_range = False
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
-            is_custom_range = True
-        except ValueError: pass
-
-    transactions = txn_query.all()
-    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'has_activity': False} for pid in product_ids}
-
-    for txn in transactions:
-        pid = txn.product_id
-        eff_unit = get_effective_unit(product_map[pid])
-        tallies[pid]['has_activity'] = True
-
-        if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
-        elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
-
-    cso_records = CategorySubOrder.query.all()
-    cso_map = {(so.category_id, so.sub_category_id): so.display_order for so in cso_records}
-
-    def get_sort_keys(p):
-        cat_order = p.category_rel.display_order if p.category_rel else 9999
-        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
-        sub_order = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
-        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
-        return (cat_order, cat_name, sub_order, sub_name, p.product_code or '')
-
-    products.sort(key=get_sort_keys)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Stock'])
-
-    for p in products:
-        if is_custom_range and not tallies[p.id]['has_activity']: continue
-        eff_unit = get_effective_unit(p)
-        current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
-        
-        writer.writerow([
-            p.category_rel.name if p.category_rel else 'OTHER',
-            p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
-            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], current_stock
-        ])
-
-    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
 
 
 @core.route('/products/export/csv', methods=['GET'])
@@ -1357,6 +1285,7 @@ def export_products_csv():
         ])
 
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
+
 import csv
 import io
 from flask import Response
