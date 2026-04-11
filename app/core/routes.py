@@ -26,14 +26,24 @@ core = Blueprint('core', __name__, url_prefix='/core')
 
 def get_effective_unit(product):
     """
-    Strictly checks the Department's unit. Completely ignores the Product's unit.
+    Strictly checks the Department's unit. 
+    Uses Flask's 'g' object to cache the query and prevent N+1 database crashes!
     """
-    if product.department_id:
+    if not product.department_id:
+        return 'pcs'
+        
+    # 1. Create a cache dictionary for this specific request if it doesn't exist yet
+    if not hasattr(g, 'dept_unit_cache'):
+        g.dept_unit_cache = {}
+        
+    # 2. If we haven't looked up this department yet, fetch it from the DB and save it
+    if product.department_id not in g.dept_unit_cache:
         dept = Department.query.get(product.department_id)
-        if dept and dept.unit:
-            return str(dept.unit).strip().lower()
-            
-    return 'pcs' 
+        g.dept_unit_cache[product.department_id] = str(dept.unit).strip().lower() if dept and dept.unit else 'pcs'
+        
+    # 3. Return the instantly cached unit (No database hit!)
+    return g.dept_unit_cache[product.department_id]
+
 
 def calculate_new_stock(current_stock, amount, unit, is_adding=True):
     """
