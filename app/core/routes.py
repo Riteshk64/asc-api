@@ -2049,20 +2049,29 @@ def update_contractor(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+
+
 @core.route('/contractors', methods=['GET'])
 @jwt_required
 def get_contractors():
-    # Only allowed for specific departments usually, or everyone?
-    # Keeping logic simple based on previous code.
-    contractors = Contractor.query.filter_by(is_active=True).all()
+    active_dept = get_active_department() 
+    
+    if g.role == "ADMIN" and not active_dept:
+         contractors = Contractor.query.filter_by(is_active=True).all()
+    else:
+         contractors = Contractor.query.filter_by(is_active=True, department_id=active_dept).all()
+    
     return jsonify([c.to_dict() for c in contractors]), 200
 
 @core.route('/contractors', methods=['POST'])
 @jwt_required
 def add_contractor():
     data = request.get_json()
+    active_dept = get_active_department()
 
-    # 🛡️ VALIDATE NAME
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
     name = data.get('name')
     if not name or not str(name).strip():
         return jsonify({"error": "Contractor Name is required and cannot be empty."}), 400
@@ -2076,7 +2085,10 @@ def add_contractor():
             return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
 
     try:
-        existing = Contractor.query.filter(Contractor.name.ilike(name)).first()
+        existing = Contractor.query.filter(
+            Contractor.name.ilike(name), 
+            Contractor.department_id == active_dept
+        ).first()
         
         if existing:
             if not existing.is_active:
@@ -2086,6 +2098,7 @@ def add_contractor():
         new_contractor = Contractor(
             name=name,
             phone=clean_phone, 
+            department_id=active_dept,
             is_active=True
         )
         db.session.add(new_contractor)
@@ -2099,6 +2112,55 @@ def add_contractor():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "Failed to add contractor", "details": str(e)}), 500
+    
+
+@core.route('/contractor-transactions', methods=['GET'])
+@jwt_required
+def contractor_transaction_report():
+    active_dept = get_active_department()
+    if not active_dept:
+        return jsonify({"error": "Department context missing"}), 400
+
+    try:
+        transactions = (
+            db.session.query(Transaction)
+            .filter(
+                Transaction.department_id == active_dept,
+                Transaction.type == 'out',
+                Transaction.is_active == True,
+                Transaction.contractor_id.isnot(None)
+            )
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+
+        if not transactions:
+            return jsonify([]), 200
+
+        result = []
+        for txn in transactions:
+            contractor = Contractor.query.get(txn.contractor_id)
+            product = Product.query.get(txn.product_id)
+
+            if not contractor or not product:
+                continue  
+
+            eff_unit = get_effective_unit(product)
+
+            result.append({
+                "contractor": contractor.name,
+                "contractor_id": contractor.id,
+                "product": product.name,
+                "product_id": product.id,
+                "sku": product.product_code,
+                "unit": eff_unit,
+                "date": txn.created_at.strftime("%Y-%m-%d"),
+                "qty": to_display_unit(txn.quantity, eff_unit) 
+            })
+
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @core.route('/categories', methods=['GET'])
 @jwt_required
