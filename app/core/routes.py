@@ -681,6 +681,36 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 
 
+@core.route('/contractors/<int:id>', methods=['PUT'])
+@jwt_required
+def update_contractor(id):
+    contractor = Contractor.query.get(id)
+    if not contractor:
+        return jsonify({"error": "Contractor not found"}), 404
+
+    data = request.get_json()
+    
+    # 🛡️ VALIDATE NAME
+    if 'name' in data: 
+        new_name = data['name']
+        if not new_name or not str(new_name).strip():
+            return jsonify({"error": "Contractor name cannot be empty."}), 400
+        contractor.name = str(new_name).strip()
+
+    # 👇 ADDED: Update Phone and Department ID
+    if 'phone' in data: 
+        contractor.phone = data['phone'] 
+        
+    if 'department_id' in data and data['department_id']:
+        contractor.department_id = int(data['department_id'])
+
+    try:
+        db.session.commit()
+        return jsonify({"message": "Contractor updated"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -2026,28 +2056,28 @@ def update_supplier(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-@core.route('/contractors/<int:id>', methods=['PUT'])
-@jwt_required
-def update_contractor(id):
-    contractor = Contractor.query.get(id)
-    if not contractor:
-        return jsonify({"error": "Contractor not found"}), 404
+# @core.route('/contractors/<int:id>', methods=['PUT'])
+# @jwt_required
+# def update_contractor(id):
+#     contractor = Contractor.query.get(id)
+#     if not contractor:
+#         return jsonify({"error": "Contractor not found"}), 404
 
-    data = request.get_json()
+#     data = request.get_json()
     
-    # 🛡️ VALIDATE NAME
-    if 'name' in data: 
-        new_name = data['name']
-        if not new_name or not str(new_name).strip():
-            return jsonify({"error": "Contractor name cannot be empty."}), 400
-        contractor.name = str(new_name).strip()
+#     # 🛡️ VALIDATE NAME
+#     if 'name' in data: 
+#         new_name = data['name']
+#         if not new_name or not str(new_name).strip():
+#             return jsonify({"error": "Contractor name cannot be empty."}), 400
+#         contractor.name = str(new_name).strip()
 
-    try:
-        db.session.commit()
-        return jsonify({"message": "Contractor updated"}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+#     try:
+#         db.session.commit()
+#         return jsonify({"message": "Contractor updated"}), 200
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"error": str(e)}), 500
 
 
 
