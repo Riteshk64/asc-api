@@ -110,6 +110,7 @@ def get_effective_unit(product):
         g.dept_unit_cache[product.department_id] = str(dept.unit).strip().lower() if dept and dept.unit else 'pcs'
         
     return g.dept_unit_cache[product.department_id]
+
 def calculate_new_stock(current_stock, amount, unit, is_adding=True):
     if not is_adding:
         amount = -amount
@@ -122,25 +123,17 @@ def calculate_new_stock(current_stock, amount, unit, is_adding=True):
             val = abs(val)
             gross = int(val)
             
-            # Safely format to a string to prevent float corruption
-            val_str = f"{val:.5f}".rstrip('0').rstrip('.')
+            # The User's Exact Rule: Multiply the exact decimal by 10
+            dozens = round((val - gross) * 10, 4)
             
-            dozens = 0
+            # Handle the "Overflow Paradox" strings (.10 and .11)
+            val_str = f"{val:.5f}".rstrip('0').rstrip('.')
             if '.' in val_str:
                 dec_str = val_str.split('.')[1]
-                
-                # If there's only 1 decimal digit (e.g. .1, .5, .9), it's 1, 5, or 9 dozen
-                if len(dec_str) == 1:
-                    dozens = int(dec_str)
-                else:
-                    first_two = int(dec_str[0:2])
-                    # Catch 10 or 11 dozen specifically
-                    if first_two == 10 or first_two == 11:
-                        dozens = first_two
-                    else:
-                        # Otherwise, take the first digit (e.g. .83 -> 8 dozen)
-                        dozens = int(dec_str[0])
-                        
+                if dec_str.startswith('10') or dec_str.startswith('11'):
+                    # Force it to read 10.x or 11.x instead of 1.0x
+                    dozens = float(dec_str[:2] + '.' + dec_str[2:]) if len(dec_str) > 2 else int(dec_str[:2])
+            
             return sign * (gross * 12 + dozens)
             
         total_dozens = to_dozens(current_stock) + to_dozens(amount)
@@ -148,20 +141,20 @@ def calculate_new_stock(current_stock, amount, unit, is_adding=True):
         sign = -1 if total_dozens < 0 else 1
         total_dozens = abs(total_dozens)
         
-        new_gross = total_dozens // 12
-        new_dozens = total_dozens % 12
+        new_gross = int(total_dozens // 12)
+        new_dozens = round(total_dozens % 12, 4)
         
-        # Save back to database format
-        if new_dozens == 10:
-            decimal_val = 0.1001 # 👈 Magic trick to prevent DB from turning .10 into .1
-        elif new_dozens == 11:
-            decimal_val = 0.11
+        # Save back to database format safely
+        if new_dozens >= 10:
+            # Save 10.5 dozen as .105 to prevent overflow
+            decimal_string = str(new_dozens).replace('.', '')
+            return sign * float(f"{new_gross}.{decimal_string}")
         else:
-            decimal_val = new_dozens / 10.0 # 👈 1-9 dozen saved safely as .1 to .9
+            # Normal Rule: Save 9.2 dozen as .92
+            return sign * (new_gross + (new_dozens / 10.0))
             
-        return sign * (new_gross + decimal_val)
-    
     return round(current_stock + amount, 2)
+
 
 # 👇 MUST BE FULLY LEFT-ALIGNED
 def get_active_department():
