@@ -24,6 +24,76 @@ from app.models.categorysuborder import CategorySubOrder
 core = Blueprint('core', __name__, url_prefix='/core')
 
 
+# def calculate_new_stock(current_stock, amount, unit, is_adding=True):
+#     if not is_adding:
+#         amount = -amount
+        
+#     safe_unit = str(unit).strip().lower() if unit else 'pcs'
+    
+#     if safe_unit in ['gross', 'dozens', 'dozen', 'base12', 'brasspart']:
+#         def to_dozens(val):
+#             sign = -1 if val < 0 else 1
+#             val = abs(val)
+#             gross = int(val)
+#             # 👇 FIX 1: Multiply by 100 to correctly catch .10 and .11
+#             dozens = round((val - gross) * 100) 
+            
+#             # Legacy fallback: If someone typed 1.4, they meant 4 dozen, not 40 dozen
+#             if dozens > 0 and dozens <= 9 and len(str(val).split('.')[-1]) == 1:
+#                 dozens = dozens * 10 
+                
+#             return sign * (gross * 12 + dozens)
+            
+#         total_dozens = to_dozens(current_stock) + to_dozens(amount)
+        
+#         sign = -1 if total_dozens < 0 else 1
+#         total_dozens = abs(total_dozens)
+        
+#         new_gross = total_dozens // 12
+#         new_dozens = total_dozens % 12
+        
+#         # 👇 FIX 2: Divide by 100.0 so 11 dozen becomes .11, not 1.1
+#         return sign * (new_gross + (new_dozens / 100.0))
+    
+#     return round(current_stock + amount, 2)
+
+# def get_effective_unit(product):
+#     """
+#     Strictly checks the Department's unit. 
+#     Uses Flask's 'g' object to cache the query and prevent N+1 database crashes!
+#     """
+#     if not product.department_id:
+#         return 'pcs'
+        
+#     # 1. Create a cache dictionary for this specific request if it doesn't exist yet
+#     if not hasattr(g, 'dept_unit_cache'):
+#         g.dept_unit_cache = {}
+        
+#     # 2. If we haven't looked up this department yet, fetch it from the DB and save it
+#     if product.department_id not in g.dept_unit_cache:
+#         dept = Department.query.get(product.department_id)
+#         g.dept_unit_cache[product.department_id] = str(dept.unit).strip().lower() if dept and dept.unit else 'pcs'
+        
+#     # 3. Return the instantly cached unit (No database hit!)
+#     return g.dept_unit_cache[product.department_id]
+
+
+
+
+# def get_active_department():
+#     # Admins can "impersonate" departments via headers
+#     if g.role == "ADMIN":
+#         try:
+#             dept_id = request.headers.get("X-Department-Id")
+#             return int(dept_id) if dept_id else None
+#         except ValueError:
+#             return None
+            
+#     # ✅ Workers always use their latest database-assigned department
+#     return g.current_user.department_id
+
+
+# 👇 MUST BE FULLY LEFT-ALIGNED
 def get_effective_unit(product):
     """
     Strictly checks the Department's unit. 
@@ -32,36 +102,45 @@ def get_effective_unit(product):
     if not product.department_id:
         return 'pcs'
         
-    # 1. Create a cache dictionary for this specific request if it doesn't exist yet
     if not hasattr(g, 'dept_unit_cache'):
         g.dept_unit_cache = {}
         
-    # 2. If we haven't looked up this department yet, fetch it from the DB and save it
     if product.department_id not in g.dept_unit_cache:
         dept = Department.query.get(product.department_id)
         g.dept_unit_cache[product.department_id] = str(dept.unit).strip().lower() if dept and dept.unit else 'pcs'
         
-    # 3. Return the instantly cached unit (No database hit!)
     return g.dept_unit_cache[product.department_id]
-
-
 def calculate_new_stock(current_stock, amount, unit, is_adding=True):
-    """
-    Calculates stock. If unit is 'gross', treats decimals as base-12 dozens.
-    Example: 0.8 + 0.4 = 1.0 (1 gross, 0 dozen)
-    """
     if not is_adding:
         amount = -amount
         
     safe_unit = str(unit).strip().lower() if unit else 'pcs'
     
-    if safe_unit == 'gross':
+    if safe_unit in ['gross', 'dozens', 'dozen', 'base12', 'brasspart']:
         def to_dozens(val):
             sign = -1 if val < 0 else 1
             val = abs(val)
             gross = int(val)
-            # Rounding fixes Python float precision quirks (e.g. 0.80000001)
-            dozens = round((val - gross) * 10) 
+            
+            # Safely format to a string to prevent float corruption
+            val_str = f"{val:.5f}".rstrip('0').rstrip('.')
+            
+            dozens = 0
+            if '.' in val_str:
+                dec_str = val_str.split('.')[1]
+                
+                # If there's only 1 decimal digit (e.g. .1, .5, .9), it's 1, 5, or 9 dozen
+                if len(dec_str) == 1:
+                    dozens = int(dec_str)
+                else:
+                    first_two = int(dec_str[0:2])
+                    # Catch 10 or 11 dozen specifically
+                    if first_two == 10 or first_two == 11:
+                        dozens = first_two
+                    else:
+                        # Otherwise, take the first digit (e.g. .83 -> 8 dozen)
+                        dozens = int(dec_str[0])
+                        
             return sign * (gross * 12 + dozens)
             
         total_dozens = to_dozens(current_stock) + to_dozens(amount)
@@ -72,13 +151,19 @@ def calculate_new_stock(current_stock, amount, unit, is_adding=True):
         new_gross = total_dozens // 12
         new_dozens = total_dozens % 12
         
-        # Convert back to decimal format (e.g., 1 gross, 4 dozen -> 1.4)
-        return sign * (new_gross + (new_dozens / 10.0))
+        # Save back to database format
+        if new_dozens == 10:
+            decimal_val = 0.1001 # 👈 Magic trick to prevent DB from turning .10 into .1
+        elif new_dozens == 11:
+            decimal_val = 0.11
+        else:
+            decimal_val = new_dozens / 10.0 # 👈 1-9 dozen saved safely as .1 to .9
+            
+        return sign * (new_gross + decimal_val)
     
-    # Standard base-10 math for 'pcs', 'kg', etc.
-    return current_stock + amount
+    return round(current_stock + amount, 2)
 
-
+# 👇 MUST BE FULLY LEFT-ALIGNED
 def get_active_department():
     # Admins can "impersonate" departments via headers
     if g.role == "ADMIN":
@@ -88,7 +173,7 @@ def get_active_department():
         except ValueError:
             return None
             
-    # ✅ Workers always use their latest database-assigned department
+    # Workers always use their latest database-assigned department
     return g.current_user.department_id
 
 @core.route('/stock/operate', methods=['POST'])
@@ -2822,6 +2907,7 @@ def get_contractor_stock(id):
 #         print(f"Error: {e}")
 #         return jsonify({"error": "Failed to fetch supplier data"}), 500
 
+
 @core.route("/suppliers/<int:id>/products", methods=["GET"])
 @jwt_required
 def get_supplier_products(id): 
@@ -2832,21 +2918,28 @@ def get_supplier_products(id):
         if product_id:
             transactions = Transaction.query.options(
                 joinedload(Transaction.product), joinedload(Transaction.supplier), joinedload(Transaction.contractor)
-            ).filter(
-                Transaction.supplier_id == id, Transaction.product_id == product_id,
+            ).join(Product).filter(
+                Transaction.supplier_id == id, 
+                Transaction.product_id == product_id,
+                Transaction.is_active == True,         # 👈 FIX: Hide deleted transactions
+                Product.is_active == True,             # 👈 FIX: Hide deleted products
                 func.lower(Transaction.type).in_(['in', 'return'])
             ).order_by(Transaction.created_at.desc()).all()
             return jsonify([t.to_dict() for t in transactions]), 200
 
         # --- MODE 2: Consolidated View ---
-        transactions = Transaction.query.options(joinedload(Transaction.product)).filter(
-            Transaction.supplier_id == id, func.lower(Transaction.type).in_(['in', 'return'])
+        transactions = Transaction.query.options(joinedload(Transaction.product)).join(Product).filter(
+            Transaction.supplier_id == id, 
+            Transaction.is_active == True,             # 👈 FIX: Hide deleted transactions
+            Product.is_active == True,                 # 👈 FIX: Hide deleted products
+            func.lower(Transaction.type).in_(['in', 'return'])
         ).all()
 
         tallies = {}
         for txn in transactions:
             p = txn.product
-            if not p: continue
+            # 👈 FIX: Double safety check to ignore inactive products in memory
+            if not p or not p.is_active: continue 
             
             eff_unit = get_effective_unit(p)
             if p.id not in tallies:
@@ -2870,7 +2963,8 @@ def get_supplier_products(id):
         return jsonify(data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+    
+    
 @core.route('/products/<int:id>/transactions', methods=['GET'])
 @jwt_required
 def get_product_transactions(id):
@@ -2964,33 +3058,55 @@ def get_product_transactions(id):
     }), 200   
 
 
-
-
 @core.route('/stock/recalibrate', methods=['POST'])
 @jwt_required
 def recalibrate_stock():
     active_dept = get_active_department()
     
-    query = Product.query.filter_by(is_active=True)
+    prod_query = Product.query.filter_by(is_active=True)
     if active_dept:
-        query = query.filter_by(department_id=active_dept)
+        prod_query = prod_query.filter_by(department_id=active_dept)
         
-    products = query.all()
+    products = prod_query.all()
+    if not products:
+        return jsonify({"message": "No products found to recalibrate."}), 200
+
+    # 1. Map out the products
+    product_ids = [p.id for p in products]
+    
+    # 2. THE OPTIMIZATION: Fetch ALL transactions in a single, lightweight query
+    txn_query = db.session.query(
+        Transaction.product_id, Transaction.type, Transaction.quantity, Transaction.supplier_id
+    ).filter(
+        Transaction.is_active == True,
+        Transaction.product_id.in_(product_ids)
+    )
+    
+    if active_dept:
+        txn_query = txn_query.filter(Transaction.department_id == active_dept)
+        
+    transactions = txn_query.all()
+
+    # 3. Group transactions by product_id in Python's memory
+    from collections import defaultdict
+    txn_by_product = defaultdict(list)
+    for pid, t_type, t_qty, sup_id in transactions:
+        txn_by_product[pid].append((t_type, t_qty, sup_id))
+
     mismatch_count = 0
     
+    # 4. Run the math from memory instantly
     for product in products:
         eff_unit = get_effective_unit(product)
-        txns = Transaction.query.filter_by(product_id=product.id, is_active=True).all()
-        
-        # Calculate from zero using our Python helper
         calculated_stock = 0.0
-        for txn in txns:
-            if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-                calculated_stock = calculate_new_stock(calculated_stock, txn.quantity, eff_unit, is_adding=True)
-            elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-                calculated_stock = calculate_new_stock(calculated_stock, txn.quantity, eff_unit, is_adding=False)
         
-        # Use abs() to handle tiny float variations (e.g. 1.2000001 != 1.2)
+        for t_type, t_qty, sup_id in txn_by_product[product.id]:
+            if t_type == 'in' or (t_type == 'return' and not sup_id):
+                calculated_stock = calculate_new_stock(calculated_stock, t_qty, eff_unit, is_adding=True)
+            elif t_type == 'out' or (t_type == 'return' and sup_id):
+                calculated_stock = calculate_new_stock(calculated_stock, t_qty, eff_unit, is_adding=False)
+        
+        # Use abs() to handle tiny float variations
         if abs(product.current_stock - calculated_stock) > 0.001:
             product.current_stock = calculated_stock
             mismatch_count += 1
