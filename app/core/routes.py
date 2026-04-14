@@ -156,6 +156,7 @@ def calculate_new_stock(current_stock, amount, unit, is_adding=True):
     return round(current_stock + amount, 2)
 
 
+
 # 👇 MUST BE FULLY LEFT-ALIGNED
 def get_active_department():
     # Admins can "impersonate" departments via headers
@@ -1496,48 +1497,64 @@ def update_transaction(id):
          return jsonify({"error": "Unauthorized"}), 403
 
     data = request.get_json()
-    try:
-        new_qty = float(data.get('qty'))
-        if new_qty <= 0: raise ValueError
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid quantity"}), 400
-
     product = txn.product
-    old_qty = txn.quantity
-
-    if old_qty == new_qty:
-        return jsonify({"message": "No change detected"}), 200
-
     eff_unit = get_effective_unit(product)
 
-    # 👇 Rollback old quantity, apply new quantity using base-12 helper
-    if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-        product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=False)
-        product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=True)
-    elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-        product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=True)
-        product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=False)
-
-    txn.quantity = new_qty
-    
-    log = ActivityLog(
-        user_id=g.current_user.id, 
-        action=f"Updated Txn #{txn.id} Qty: {old_qty} -> {new_qty}", 
-        transaction_id=txn.id
-    )
-    
-    db.session.add(log)
-    db.session.add(product) 
-    
     try:
+        # 1. Handle Quantity Update (Requires math rollback)
+        if 'qty' in data and data['qty'] != "":
+            new_qty = float(data.get('qty'))
+            if new_qty <= 0: raise ValueError("Quantity must be positive")
+            
+            old_qty = txn.quantity
+            if old_qty != new_qty:
+                if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+                    product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=False)
+                    product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=True)
+                elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+                    product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=True)
+                    product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=False)
+                txn.quantity = new_qty
+
+        # 2. Handle Entity Name Update (Supplier / Contractor)
+        if 'entity_name' in data and data['entity_name'].strip():
+            entity_name = data['entity_name'].strip()
+            
+            # If it's a Supplier Transaction
+            if txn.type in ['in', 'return'] and txn.supplier_id:
+                sup = Supplier.query.filter(Supplier.name.ilike(entity_name), Supplier.department_id == product.department_id).first()
+                if not sup:
+                    sup = Supplier(name=entity_name, is_active=True, department_id=product.department_id)
+                    db.session.add(sup)
+                    db.session.flush()
+                txn.supplier_id = sup.id
+                
+            # If it's a Contractor Transaction
+            elif txn.type in ['out', 'return'] and txn.contractor_id:
+                con = Contractor.query.filter(Contractor.name.ilike(entity_name)).first()
+                if not con:
+                    con = Contractor(name=entity_name, is_active=True)
+                    db.session.add(con)
+                    db.session.flush()
+                txn.contractor_id = con.id
+
+        # 3. Handle Challan & Notes
+        if 'challan_id' in data:
+            txn.challan_id = data['challan_id'].strip() if data['challan_id'].strip() else None
+        if 'notes' in data:
+            txn.notes = data['notes'].strip() if data['notes'].strip() else None
+
+        log = ActivityLog(user_id=g.current_user.id, action=f"Edited Txn #{txn.id}", transaction_id=txn.id)
+        db.session.add(log)
+        db.session.add(product) 
+        
         db.session.commit()
-        return jsonify({
-            "message": "Transaction updated", 
-            "new_stock": product.current_stock
-        }), 200
+        return jsonify({"message": "Transaction updated", "new_stock": product.current_stock}), 200
+
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
 @core.route('/recycle-bin', methods=['GET'])
 @jwt_required
 @admin_only
