@@ -170,6 +170,121 @@ def get_active_department():
     # Workers always use their latest database-assigned department
     return g.current_user.department_id
 
+# @core.route('/stock/operate', methods=['POST'])
+# @jwt_required
+# def stock_operation():
+#     data = request.get_json()
+#     product_id = data.get('product_id')
+#     sku = data.get('sku')
+#     product_name = data.get('productName')
+#     op_type = data.get('type')
+#     notes = data.get('notes', '').strip()
+#     challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
+
+#     try:
+#         qty = float(data.get('qty', 0))
+#         if qty <= 0: raise ValueError
+#     except ValueError:
+#         return jsonify({"error": "Invalid positive quantity required"}), 400
+
+#     active_dept = get_active_department()
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+
+#     product = None
+#     if product_id:
+#         product = Product.query.get(product_id)
+#     if not product and sku and product_name:
+#         product = Product.query.filter_by(product_code=sku, name=product_name, department_id=active_dept).first()
+#     if not product and sku:
+#         product = Product.query.filter_by(product_code=sku, department_id=active_dept).first()
+
+#     if not product:
+#         if op_type != 'in': return jsonify({"error": "Product not found"}), 404
+#         if not product_name: return jsonify({"error": "Product Name required for new products"}), 400
+
+#         product = Product(
+#             name=product_name, product_code=sku, unit=data.get('unit', 'pcs'),
+#             current_stock=0.0, department_id=active_dept, is_active=True
+#         )
+#         db.session.add(product)
+#         db.session.flush()
+
+#     if product.department_id != active_dept and g.role != 'ADMIN':
+#         return jsonify({"error": "Cross-department operation blocked"}), 403
+
+#     txn_dept_id = product.department_id
+#     supplier_id = data.get('supplier_id')
+#     contractor_id = data.get('contractor_id')
+
+#     eff_unit = get_effective_unit(product)
+
+#     if op_type == 'in':
+#         sup_name = data.get('supplier_name', '').strip()
+#         if not sup_name and not supplier_id: return jsonify({"error": "Supplier Name required."}), 400
+#         product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
+#         if not supplier_id:
+#             supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+#             if not supplier:
+#                 supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+#                 db.session.add(supplier)
+#                 db.session.flush()
+#             supplier_id = supplier.id
+        
+#     elif op_type == 'out':
+#         cont_name = data.get('contractor_name', '').strip()
+#         if not cont_name and not contractor_id: return jsonify({"error": "Contractor Name required."}), 400
+#         product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+#         if not contractor_id:
+#             contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+#             if not contractor:
+#                 contractor = Contractor(name=cont_name, is_active=True)
+#                 db.session.add(contractor)
+#                 db.session.flush()
+#             contractor_id = contractor.id
+
+#     elif op_type == 'return':
+#         sup_name = data.get('supplier_name', '').strip()
+#         cont_name = data.get('contractor_name', '').strip()
+#         if not sup_name and not cont_name and not supplier_id and not contractor_id:
+#              return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
+        
+#         if sup_name or supplier_id:
+#             product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+#             if not supplier_id:
+#                 supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+#                 if not supplier:
+#                     supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+#                     db.session.add(supplier)
+#                     db.session.flush()
+#                 supplier_id = supplier.id
+#         elif cont_name or contractor_id:
+#             product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)  
+#             if not contractor_id:
+#                 contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+#                 if not contractor:
+#                     contractor = Contractor(name=cont_name, is_active=True)
+#                     db.session.add(contractor)
+#                     db.session.flush()
+#                 contractor_id = contractor.id
+
+#     txn = Transaction(
+#         product_id=product.id, type=op_type, quantity=qty,
+#         supplier_id=supplier_id or data.get('supplier_id'),
+#         contractor_id=contractor_id or data.get('contractor_id'),
+#         department_id=txn_dept_id, created_by=g.current_user.id, is_active=True,
+#         notes=notes if notes else None, challan_id=challan_id
+#     )
+
+#     try:
+#         db.session.add(txn)
+#         db.session.add(product) 
+#         db.session.commit()
+#         return jsonify({"message": "Stock updated", "new_qty": product.current_stock}), 200
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"error": str(e)}), 500
+
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
 def stock_operation():
@@ -219,14 +334,15 @@ def stock_operation():
 
     eff_unit = get_effective_unit(product)
 
+    # 👇 FIX: Changed all entity creations to bind to `txn_dept_id` instead of `active_dept`
     if op_type == 'in':
         sup_name = data.get('supplier_name', '').strip()
         if not sup_name and not supplier_id: return jsonify({"error": "Supplier Name required."}), 400
         product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
         if not supplier_id:
-            supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+            supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == txn_dept_id).first()
             if not supplier:
-                supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+                supplier = Supplier(name=sup_name, is_active=True, department_id=txn_dept_id)
                 db.session.add(supplier)
                 db.session.flush()
             supplier_id = supplier.id
@@ -236,9 +352,9 @@ def stock_operation():
         if not cont_name and not contractor_id: return jsonify({"error": "Contractor Name required."}), 400
         product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
         if not contractor_id:
-            contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+            contractor = Contractor.query.filter(Contractor.name.ilike(cont_name), Contractor.department_id == txn_dept_id).first()
             if not contractor:
-                contractor = Contractor(name=cont_name, is_active=True)
+                contractor = Contractor(name=cont_name, is_active=True, department_id=txn_dept_id)
                 db.session.add(contractor)
                 db.session.flush()
             contractor_id = contractor.id
@@ -252,18 +368,18 @@ def stock_operation():
         if sup_name or supplier_id:
             product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
             if not supplier_id:
-                supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == active_dept).first()
+                supplier = Supplier.query.filter(Supplier.name.ilike(sup_name), Supplier.department_id == txn_dept_id).first()
                 if not supplier:
-                    supplier = Supplier(name=sup_name, is_active=True, department_id=active_dept)
+                    supplier = Supplier(name=sup_name, is_active=True, department_id=txn_dept_id)
                     db.session.add(supplier)
                     db.session.flush()
                 supplier_id = supplier.id
         elif cont_name or contractor_id:
             product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)  
             if not contractor_id:
-                contractor = Contractor.query.filter(Contractor.name.ilike(cont_name)).first()
+                contractor = Contractor.query.filter(Contractor.name.ilike(cont_name), Contractor.department_id == txn_dept_id).first()
                 if not contractor:
-                    contractor = Contractor(name=cont_name, is_active=True)
+                    contractor = Contractor(name=cont_name, is_active=True, department_id=txn_dept_id)
                     db.session.add(contractor)
                     db.session.flush()
                 contractor_id = contractor.id
@@ -284,6 +400,110 @@ def stock_operation():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
+# @core.route('/stock/operate/bulk', methods=['POST'])
+# @jwt_required
+# def bulk_stock_operation():
+#     data = request.get_json()
+#     active_dept = get_active_department()
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+
+#     items = data.get('items', [])
+#     if not items:
+#         return jsonify({"error": "No items provided."}), 400
+
+#     op_type = data.get('type')
+#     supplier_name = data.get('supplier_name', '').strip()
+#     contractor_name = data.get('contractor_name', '').strip()
+#     challan_id = data.get('challan_id', '').strip() if data.get('challan_id') else None
+#     date_str = data.get('date', '').strip()
+#     notes = data.get('notes', '').strip()
+
+#     op_date = datetime.utcnow()
+#     if date_str:
+#         try:
+#             parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
+#             op_date = datetime.combine(parsed_date.date(), datetime.utcnow().time())
+#         except ValueError: pass 
+
+#     supplier_id = None
+#     contractor_id = None
+
+#     if op_type == 'in':
+#         if not supplier_name: return jsonify({"error": "Supplier Name is required for Stock In."}), 400
+#         supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
+#         if not supplier:
+#             supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
+#             db.session.add(supplier)
+#             db.session.flush()
+#         supplier_id = supplier.id
+
+#     elif op_type == 'out':
+#         if not contractor_name: return jsonify({"error": "Contractor Name is required for Stock Out."}), 400
+#         contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
+#         if not contractor:
+#             contractor = Contractor(name=contractor_name, is_active=True)
+#             db.session.add(contractor)
+#             db.session.flush()
+#         contractor_id = contractor.id
+
+#     elif op_type == 'return':
+#         if not supplier_name and not contractor_name:
+#             return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
+#         if supplier_name:
+#             supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
+#             if not supplier:
+#                 supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
+#                 db.session.add(supplier)
+#                 db.session.flush()
+#             supplier_id = supplier.id
+#         elif contractor_name:
+#             contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
+#             if not contractor:
+#                 contractor = Contractor(name=contractor_name, is_active=True)
+#                 db.session.add(contractor)
+#                 db.session.flush()
+#             contractor_id = contractor.id
+
+#     try:
+#         for item in items:
+#             prod_id = item.get('product_id')
+#             qty = float(item.get('qty', 0))
+#             if qty <= 0: continue
+
+#             product = Product.query.get(prod_id)
+#             if not product or (product.department_id != active_dept and g.role != 'ADMIN'):
+#                 raise Exception(f"Invalid or unauthorized product ID: {prod_id}")
+
+#             eff_unit = get_effective_unit(product)
+
+#             if op_type == 'in':
+#                 product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
+#             elif op_type == 'out':
+#                 product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+#             elif op_type == 'return':
+#                 if supplier_name:
+#                     product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+#                 elif contractor_name:
+#                     product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
+
+#             txn = Transaction(
+#                 product_id=product.id, type=op_type, quantity=qty,
+#                 supplier_id=supplier_id, contractor_id=contractor_id, department_id=product.department_id,
+#                 created_by=g.current_user.id, is_active=True,
+#                 notes=notes if notes else None, challan_id=challan_id,
+#                 created_at=op_date 
+#             )
+#             db.session.add(txn)
+#             db.session.add(product)
+
+#         db.session.commit()
+#         return jsonify({"message": "Bulk stock operation successful"}), 200
+
+#     except Exception as e:
+#         db.session.rollback() 
+#         return jsonify({"error": str(e)}), 400
 
 @core.route('/stock/operate/bulk', methods=['POST'])
 @jwt_required
@@ -311,44 +531,9 @@ def bulk_stock_operation():
             op_date = datetime.combine(parsed_date.date(), datetime.utcnow().time())
         except ValueError: pass 
 
-    supplier_id = None
-    contractor_id = None
-
-    if op_type == 'in':
-        if not supplier_name: return jsonify({"error": "Supplier Name is required for Stock In."}), 400
-        supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
-        if not supplier:
-            supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
-            db.session.add(supplier)
-            db.session.flush()
-        supplier_id = supplier.id
-
-    elif op_type == 'out':
-        if not contractor_name: return jsonify({"error": "Contractor Name is required for Stock Out."}), 400
-        contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
-        if not contractor:
-            contractor = Contractor(name=contractor_name, is_active=True)
-            db.session.add(contractor)
-            db.session.flush()
-        contractor_id = contractor.id
-
-    elif op_type == 'return':
-        if not supplier_name and not contractor_name:
-            return jsonify({"error": "A Supplier or Contractor is required to process a return."}), 400
-        if supplier_name:
-            supplier = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == active_dept).first()
-            if not supplier:
-                supplier = Supplier(name=supplier_name, is_active=True, department_id=active_dept)
-                db.session.add(supplier)
-                db.session.flush()
-            supplier_id = supplier.id
-        elif contractor_name:
-            contractor = Contractor.query.filter(Contractor.name.ilike(contractor_name)).first()
-            if not contractor:
-                contractor = Contractor(name=contractor_name, is_active=True)
-                db.session.add(contractor)
-                db.session.flush()
-            contractor_id = contractor.id
+    # 👇 IN-MEMORY CACHE: Prevents N+1 database crashes
+    supplier_cache = {}
+    contractor_cache = {}
 
     try:
         for item in items:
@@ -361,20 +546,67 @@ def bulk_stock_operation():
                 raise Exception(f"Invalid or unauthorized product ID: {prod_id}")
 
             eff_unit = get_effective_unit(product)
+            prod_dept = product.department_id
+            
+            item_sup_id = None
+            item_con_id = None
 
+            # 👇 CONTEXTUAL LOOKUP: Binds the entity strictly to the product's true department
             if op_type == 'in':
+                if not supplier_name: raise Exception("Supplier Name is required for Stock In.")
+                if prod_dept not in supplier_cache:
+                    sup = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == prod_dept).first()
+                    if not sup:
+                        sup = Supplier(name=supplier_name, is_active=True, department_id=prod_dept)
+                        db.session.add(sup)
+                        db.session.flush()
+                    supplier_cache[prod_dept] = sup.id
+                
+                item_sup_id = supplier_cache[prod_dept]
                 product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
+
             elif op_type == 'out':
+                if not contractor_name: raise Exception("Contractor Name is required for Stock Out.")
+                if prod_dept not in contractor_cache:
+                    con = Contractor.query.filter(Contractor.name.ilike(contractor_name), Contractor.department_id == prod_dept).first()
+                    if not con:
+                        con = Contractor(name=contractor_name, is_active=True, department_id=prod_dept)
+                        db.session.add(con)
+                        db.session.flush()
+                    contractor_cache[prod_dept] = con.id
+                
+                item_con_id = contractor_cache[prod_dept]
                 product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+
             elif op_type == 'return':
+                if not supplier_name and not contractor_name:
+                    raise Exception("A Supplier or Contractor is required to process a return.")
+                
                 if supplier_name:
+                    if prod_dept not in supplier_cache:
+                        sup = Supplier.query.filter(Supplier.name.ilike(supplier_name), Supplier.department_id == prod_dept).first()
+                        if not sup:
+                            sup = Supplier(name=supplier_name, is_active=True, department_id=prod_dept)
+                            db.session.add(sup)
+                            db.session.flush()
+                        supplier_cache[prod_dept] = sup.id
+                    item_sup_id = supplier_cache[prod_dept]
                     product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=False)
+                
                 elif contractor_name:
+                    if prod_dept not in contractor_cache:
+                        con = Contractor.query.filter(Contractor.name.ilike(contractor_name), Contractor.department_id == prod_dept).first()
+                        if not con:
+                            con = Contractor(name=contractor_name, is_active=True, department_id=prod_dept)
+                            db.session.add(con)
+                            db.session.flush()
+                        contractor_cache[prod_dept] = con.id
+                    item_con_id = contractor_cache[prod_dept]
                     product.current_stock = calculate_new_stock(product.current_stock, qty, eff_unit, is_adding=True)
 
             txn = Transaction(
                 product_id=product.id, type=op_type, quantity=qty,
-                supplier_id=supplier_id, contractor_id=contractor_id, department_id=product.department_id,
+                supplier_id=item_sup_id, contractor_id=item_con_id, department_id=prod_dept,
                 created_by=g.current_user.id, is_active=True,
                 notes=notes if notes else None, challan_id=challan_id,
                 created_at=op_date 
@@ -388,8 +620,7 @@ def bulk_stock_operation():
     except Exception as e:
         db.session.rollback() 
         return jsonify({"error": str(e)}), 400
-
-
+    
 # @core.route('/stock/operate', methods=['POST'])
 # @jwt_required
 # def stock_operation():
@@ -1485,6 +1716,77 @@ def export_transactions_csv():
     return Response(output, mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=Transaction_History.csv"})
 
 
+# @core.route('/transactions/<int:id>', methods=['PUT'])
+# @jwt_required
+# @admin_only
+# def update_transaction(id):
+#     txn = Transaction.query.get(id)
+#     if not txn:
+#         return jsonify({"error": "Transaction not found"}), 404
+
+#     if g.role != 'ADMIN' and txn.product.department_id != g.department_id:
+#          return jsonify({"error": "Unauthorized"}), 403
+
+#     data = request.get_json()
+#     product = txn.product
+#     eff_unit = get_effective_unit(product)
+
+#     try:
+#         # 1. Handle Quantity Update (Requires math rollback)
+#         if 'qty' in data and data['qty'] != "":
+#             new_qty = float(data.get('qty'))
+#             if new_qty <= 0: raise ValueError("Quantity must be positive")
+            
+#             old_qty = txn.quantity
+#             if old_qty != new_qty:
+#                 if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+#                     product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=False)
+#                     product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=True)
+#                 elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+#                     product.current_stock = calculate_new_stock(product.current_stock, old_qty, eff_unit, is_adding=True)
+#                     product.current_stock = calculate_new_stock(product.current_stock, new_qty, eff_unit, is_adding=False)
+#                 txn.quantity = new_qty
+
+#         # 2. Handle Entity Name Update (Supplier / Contractor)
+#         if 'entity_name' in data and data['entity_name'].strip():
+#             entity_name = data['entity_name'].strip()
+            
+#             # If it's a Supplier Transaction
+#             if txn.type in ['in', 'return'] and txn.supplier_id:
+#                 sup = Supplier.query.filter(Supplier.name.ilike(entity_name), Supplier.department_id == product.department_id).first()
+#                 if not sup:
+#                     sup = Supplier(name=entity_name, is_active=True, department_id=product.department_id)
+#                     db.session.add(sup)
+#                     db.session.flush()
+#                 txn.supplier_id = sup.id
+                
+#             # If it's a Contractor Transaction
+#             elif txn.type in ['out', 'return'] and txn.contractor_id:
+#                 con = Contractor.query.filter(Contractor.name.ilike(entity_name)).first()
+#                 if not con:
+#                     con = Contractor(name=entity_name, is_active=True)
+#                     db.session.add(con)
+#                     db.session.flush()
+#                 txn.contractor_id = con.id
+
+#         # 3. Handle Challan & Notes
+#         if 'challan_id' in data:
+#             txn.challan_id = data['challan_id'].strip() if data['challan_id'].strip() else None
+#         if 'notes' in data:
+#             txn.notes = data['notes'].strip() if data['notes'].strip() else None
+
+#         log = ActivityLog(user_id=g.current_user.id, action=f"Edited Txn #{txn.id}", transaction_id=txn.id)
+#         db.session.add(log)
+#         db.session.add(product) 
+        
+#         db.session.commit()
+#         return jsonify({"message": "Transaction updated", "new_stock": product.current_stock}), 200
+
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({"error": str(e)}), 500
+
+
 @core.route('/transactions/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
@@ -1520,7 +1822,6 @@ def update_transaction(id):
         if 'entity_name' in data and data['entity_name'].strip():
             entity_name = data['entity_name'].strip()
             
-            # If it's a Supplier Transaction
             if txn.type in ['in', 'return'] and txn.supplier_id:
                 sup = Supplier.query.filter(Supplier.name.ilike(entity_name), Supplier.department_id == product.department_id).first()
                 if not sup:
@@ -1529,11 +1830,11 @@ def update_transaction(id):
                     db.session.flush()
                 txn.supplier_id = sup.id
                 
-            # If it's a Contractor Transaction
             elif txn.type in ['out', 'return'] and txn.contractor_id:
-                con = Contractor.query.filter(Contractor.name.ilike(entity_name)).first()
+                # 👇 FIX: Lock updates to the product's department
+                con = Contractor.query.filter(Contractor.name.ilike(entity_name), Contractor.department_id == product.department_id).first()
                 if not con:
-                    con = Contractor(name=entity_name, is_active=True)
+                    con = Contractor(name=entity_name, is_active=True, department_id=product.department_id)
                     db.session.add(con)
                     db.session.flush()
                 txn.contractor_id = con.id
@@ -1554,7 +1855,8 @@ def update_transaction(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
+    
+    
 @core.route('/recycle-bin', methods=['GET'])
 @jwt_required
 @admin_only
