@@ -7,8 +7,9 @@ from datetime import datetime, date
 import calendar
 from sqlalchemy.orm import joinedload
 from sqlalchemy import or_, and_
-
+import os
 # Import ALL models
+from app.models.order import Order, OrderItem
 from app.models.department import Department
 from app.models.supplier import Supplier
 from app.models.contractor import Contractor
@@ -284,6 +285,160 @@ def get_active_department():
 #     except Exception as e:
 #         db.session.rollback()
 #         return jsonify({"error": str(e)}), 500
+
+
+@core.route('/clients', methods=['GET'])
+@jwt_required
+def get_clients():
+    """Fetches all clients restricted to the active department"""
+    active_dept = get_active_department()
+    
+    query = User.query.filter_by(role='CLIENT', is_active=True)
+    
+    if active_dept:
+        query = query.filter_by(department_id=active_dept)
+        
+    clients = query.order_by(User.first_name.asc()).all()
+    
+    return jsonify([client.to_dict() for client in clients]), 200
+
+@core.route('/orders/place', methods=['POST'])
+@jwt_required
+def place_order():
+    """Client places a new order tied strictly to their department"""
+    if g.role != 'CLIENT':
+        return jsonify({"error": "Only registered clients can place orders"}), 403
+
+    data = request.get_json()
+    items = data.get('items', [])
+    
+    if not items:
+        return jsonify({"error": "Order cannot be empty"}), 400
+
+    try:
+        # 👇 STRICT LOCK: The order is forced into the Client's assigned department
+        client_dept_id = g.current_user.department_id
+        
+        if not client_dept_id:
+            return jsonify({"error": "Your client profile is not assigned to a department. Please contact support."}), 400
+
+        new_order = Order(
+            user_id=g.current_user.id,
+            department_id=client_dept_id, # 👈 Tied permanently to the client's dept
+            notes=data.get('notes', ''),
+            status='PENDING'
+        )
+        db.session.add(new_order)
+        db.session.flush()
+
+        # Add the items... (rest of the logic remains exactly the same as above)
+        for item in items:
+            order_item = OrderItem(
+                order_id=new_order.id,
+                product_id=item['product_id'],
+                quantity=float(item['qty'])
+            )
+            db.session.add(order_item)
+
+        db.session.commit()
+        return jsonify({"message": "Order placed successfully!", "order_id": new_order.id}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@core.route('/orders/my-orders', methods=['GET'])
+@jwt_required
+def get_my_orders():
+    """Client views their own order history"""
+    orders = Order.query.filter_by(user_id=g.current_user.id).order_by(desc(Order.created_at)).all()
+    return jsonify([o.to_dict() for o in orders]), 200
+
+
+@core.route('/orders', methods=['GET'])
+@jwt_required
+def get_all_orders():
+    """Company views all pending/fulfilled orders"""
+    active_dept = get_active_department()
+    
+    query = Order.query
+    # If it's a worker, only show orders meant for their department
+    if g.role != 'ADMIN' and active_dept:
+        query = query.filter_by(department_id=active_dept)
+        
+    orders = query.order_by(desc(Order.created_at)).all()
+    return jsonify([o.to_dict() for o in orders]), 200
+
+
+@core.route('/orders/<int:order_id>/fulfill', methods=['POST'])
+@jwt_required
+def fulfill_order(order_id):
+    """
+    The Magic Bridge: Approves the order, deducts stock, and creates 
+    official stock-out transactions under the Client's Contractor profile.
+    """
+    # Requires standard permissions check here based on your decorators
+    active_dept = get_active_department()
+    
+    order = Order.query.get(order_id)
+    if not order:
+        return jsonify({"error": "Order not found"}), 404
+        
+    if order.status == 'FULFILLED':
+        return jsonify({"error": "Order is already fulfilled"}), 400
+
+    client_user = order.user
+
+    try:
+        # 1. SMART LINK: Find or Create a 'Contractor/Client' profile using the User's Phone
+        # This keeps your existing Inventory Transaction history perfectly clean.
+        client_profile = Contractor.query.filter_by(phone=client_user.phoneno).first()
+        if not client_profile:
+            client_profile = Contractor(
+                name=f"{client_user.first_name} {client_user.last_name}".strip(),
+                phone=client_user.phoneno,
+                department_id=order.department_id or active_dept,
+                is_active=True
+            )
+            db.session.add(client_profile)
+            db.session.flush()
+
+        # 2. Process Inventory for each item
+        for item in order.items:
+            product = item.product
+            eff_unit = get_effective_unit(product)
+
+            # Check if we have enough stock!
+            if product.current_stock < item.quantity:
+                raise Exception(f"Insufficient stock for {product.name}. Have: {product.current_stock}, Need: {item.quantity}")
+
+            # Deduct Stock
+            product.current_stock = calculate_new_stock(product.current_stock, item.quantity, eff_unit, is_adding=False)
+            
+            # Log the official Transaction
+            txn = Transaction(
+                product_id=product.id, 
+                type='out', 
+                quantity=item.quantity,
+                contractor_id=client_profile.id, # Tied safely to the client
+                department_id=product.department_id, 
+                created_by=g.current_user.id, 
+                is_active=True,
+                notes=f"Auto-fulfilled from Order #{order.id}"
+            )
+            db.session.add(txn)
+            db.session.add(product)
+
+        # 3. Mark the Order as complete
+        order.status = 'FULFILLED'
+        db.session.commit()
+
+        return jsonify({"message": "Order fulfilled and inventory updated!"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 400
+
 
 @core.route('/stock/operate', methods=['POST'])
 @jwt_required
@@ -1033,11 +1188,9 @@ def get_products():
     search_term = request.args.get('search', '').strip()
     cat_ids = request.args.get('cats', '')
     sub_ids = request.args.get('subs', '')
-
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    # 1. Fetch Filtered Products
     base_query = db.session.query(Product).options(
         joinedload(Product.category_rel),
         joinedload(Product.sub_category_rel)
@@ -1051,59 +1204,77 @@ def get_products():
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
-
     if cat_ids:
-        base_query = base_query.filter(Product.category_id.in_([int(x) for x in cat_ids.split(',')]))
-
+        base_query = base_query.filter(
+            Product.category_id.in_([int(x) for x in cat_ids.split(',')])
+        )
     if sub_ids:
-        base_query = base_query.filter(Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')]))
+        base_query = base_query.filter(
+            Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')])
+        )
 
-    pagination = base_query.order_by(Product.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    pagination = base_query.order_by(Product.id.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
     products = pagination.items
 
-    if not products:
-        return jsonify({"data": [], "pagination": {"page": page, "per_page": per_page, "total": 0, "pages": 0}}), 200
+    # NO DATE FILTER: Just return current_stock directly, zero transaction queries
+    if not start_str or not end_str:
+        data = []
+        for p in products:
+            p_dict = p.to_dict()
+            p_dict['total_stock_in'] = None
+            p_dict['total_stock_out'] = None
+            data.append(p_dict)
+
+        return jsonify({
+            "data": data,
+            "pagination": {
+                "page": page, "per_page": per_page,
+                "total": pagination.total, "pages": pagination.pages
+            }
+        }), 200
+
+    # DATE FILTER ACTIVE: Now we actually need to query transactions
+    try:
+        start_date = datetime.strptime(start_str, '%Y-%m-%d')
+        end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(
+            hour=23, minute=59, second=59
+        )
+    except ValueError:
+        return jsonify({"error": "Invalid date format"}), 400
 
     product_ids = [p.id for p in products]
     product_map = {p.id: p for p in products}
 
-    # 2. Fetch Transactions for ONLY the paginated products
-    txn_query = Transaction.query.filter(
+    transactions = Transaction.query.filter(
         Transaction.is_active == True,
         Transaction.department_id == active_dept,
-        Transaction.product_id.in_(product_ids)
-    )
+        Transaction.product_id.in_(product_ids),
+        Transaction.created_at.between(start_date, end_date)
+    ).all()
 
-    is_date_filtered = False
-    if start_str and end_str:
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d')
-            end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            txn_query = txn_query.filter(Transaction.created_at.between(start_date, end_date))
-            is_date_filtered = True
-        except ValueError:
-            pass
-
-    transactions = txn_query.all()
-
-    # 3. Python Math Tally (Fixes the 3.2 issue)
-    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'moved': False} for pid in product_ids}
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'moved': False} 
+               for pid in product_ids}
 
     for txn in transactions:
         pid = txn.product_id
-        eff_unit = get_effective_unit(product_map[pid])
+        p = product_map[pid]
         tallies[pid]['moved'] = True
 
         if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-            tallies[pid]['t_in'] = calculate_new_stock(tallies[pid]['t_in'], txn.quantity, eff_unit, is_adding=True)
+            tallies[pid]['t_in'] = calculate_new_stock(
+                tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
+            )
         elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-            tallies[pid]['t_out'] = calculate_new_stock(tallies[pid]['t_out'], txn.quantity, eff_unit, is_adding=True)
+            tallies[pid]['t_out'] = calculate_new_stock(
+                tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
+            )
 
-    # 4. Map to Result
     data = []
     for p in products:
-        if is_date_filtered and not tallies[p.id]['moved']:
-            continue
+        if not tallies[p.id]['moved']:
+            continue  # Exclude products with no activity in the date range
         p_dict = p.to_dict()
         p_dict['total_stock_in'] = tallies[p.id]['t_in']
         p_dict['total_stock_out'] = tallies[p.id]['t_out']
@@ -1112,13 +1283,10 @@ def get_products():
     return jsonify({
         "data": data,
         "pagination": {
-            "page": page,
-            "per_page": per_page,
-            "total": pagination.total,
-            "pages": pagination.pages
+            "page": page, "per_page": per_page,
+            "total": pagination.total, "pages": pagination.pages
         }
     }), 200
-
 
 
 @core.route('/products/search', methods=['GET'])
@@ -2209,14 +2377,26 @@ def add_employee():
 @jwt_required
 @admin_only
 def update_employee(id):
-    """
-    Update an existing worker's details (Name, Phone, Dept, Role, Status)
-    """
     user = User.query.get(id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
     data = request.get_json()
+
+    # 🛡️ THE SUPER ADMIN SHIELD (By Phone Number)
+    super_admin_phone = os.environ.get('SUPER_ADMIN_PHONE')
+    if user.phoneno == super_admin_phone:
+        if 'role' in data and data['role'] != 'ADMIN':
+            return jsonify({"error": "You cannot demote the Super Admin account."}), 403
+        if 'is_active' in data and data['is_active'] is False:
+            return jsonify({"error": "You cannot disable the Super Admin account."}), 403
+
+    # 🛡️ THE "DON'T LOCK YOURSELF OUT" SHIELD
+    if g.current_user.id == id:
+        if 'role' in data and data['role'] != g.current_user.role:
+            return jsonify({"error": "You cannot change your own role."}), 400
+        if 'is_active' in data and data['is_active'] is False:
+            return jsonify({"error": "You cannot disable your own account."}), 400
 
     # 1. Update Phone (Unique Check)
     if 'phone' in data and data['phone'] != user.phoneno:
@@ -2421,10 +2601,10 @@ def get_suppliers():
     active_dept = get_active_department() 
     
     if g.role == "ADMIN" and not active_dept:
-         suppliers = Supplier.query.filter_by(is_active=True).all()
+     suppliers = Supplier.query.filter_by(is_active=True).all()
     else:
-         # This forces the filter to the selected department
-         suppliers = Supplier.query.filter_by(is_active=True, department_id=active_dept).all()
+        # 👈 Strict isolation applied here
+        suppliers = Supplier.query.filter_by(is_active=True, department_id=active_dept).all()
     
     return jsonify([s.to_dict() for s in suppliers]), 200
 @core.route('/suppliers/<int:id>', methods=['PUT'])
