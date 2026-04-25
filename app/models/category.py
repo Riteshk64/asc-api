@@ -6,6 +6,7 @@ class Category(db.Model):
     name = db.Column(db.String(50), unique=True, nullable=False)
     # 👆 Higher numbers go lower in the PDF
     display_order = db.Column(db.Integer, default=0) 
+    department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
     
     products = db.relationship('Product', backref='category_rel', lazy=True)
     is_active = db.Column(db.Boolean, default=True)

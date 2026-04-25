@@ -7,7 +7,6 @@ class OrderItem(db.Model):
     order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
     product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
     
-    # 👇 Tracks partial fulfillments
     ordered_qty = db.Column(db.Float, nullable=False)
     dispatched_qty = db.Column(db.Float, default=0.0) 
     
