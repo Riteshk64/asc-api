@@ -1191,6 +1191,10 @@ def get_products():
     sub_ids = request.args.get('subs', '')
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
+    
+    # 👇 1. Grab sorting parameters from the frontend
+    sort_by = request.args.get('sort_by', 'id')
+    sort_order = request.args.get('sort_order', 'desc')
 
     base_query = db.session.query(Product).options(
         joinedload(Product.category_rel),
@@ -1214,9 +1218,23 @@ def get_products():
             Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')])
         )
 
-    pagination = base_query.order_by(Product.id.desc()).paginate(
-        page=page, per_page=per_page, error_out=False
-    )
+    # 👇 2. Apply Dynamic Sorting
+    if sort_by == 'name':
+        # Use func.lower so 'apple' doesn't get sorted after 'Zebra'
+        order_col = func.lower(Product.name)
+    elif sort_by == 'qty':
+        order_col = Product.current_stock
+    else:
+        order_col = Product.id
+
+    if sort_order == 'asc':
+        # 👇 Notice we are using base_query and Product.id here!
+        base_query = base_query.order_by(order_col.asc(), Product.id.asc())
+    else:
+        base_query = base_query.order_by(order_col.desc(), Product.id.desc())
+
+    # 👇 Execute pagination
+    pagination = base_query.paginate(page=page, per_page=per_page, error_out=False)
     products = pagination.items
 
     # NO DATE FILTER: Just return current_stock directly, zero transaction queries
@@ -1288,7 +1306,6 @@ def get_products():
             "total": pagination.total, "pages": pagination.pages
         }
     }), 200
-
 
 @core.route('/products/search', methods=['GET'])
 @jwt_required
@@ -1505,7 +1522,7 @@ def approve_user():
                 target_user.is_active = True
                 target_user.approval_status = 'APPROVED'
                 
-                # 👇 NEW: Automatically create a Contractor profile if they are a CLIENT
+                # Automatically create a Contractor profile if they are a CLIENT
                 if target_user.role == 'CLIENT':
                     existing_contractor = Contractor.query.filter_by(phone=target_user.phoneno).first()
                     if not existing_contractor:
@@ -1516,6 +1533,26 @@ def approve_user():
                             is_active=True
                         )
                         db.session.add(new_contractor)
+
+                # 👇 NEW: Automatically create a Supplier profile if they are a SUPPLIER
+                elif target_user.role == 'SUPPLIER':
+                    existing_supplier = Supplier.query.filter_by(phone_number=target_user.phoneno).first()
+                    if not existing_supplier:
+                        new_supplier = Supplier(
+                            name=f"{target_user.first_name} {target_user.last_name}".strip(),
+                            phone_number=target_user.phoneno,
+                            department_id=target_user.department_id,
+                            is_active=True
+                        )
+                        db.session.add(new_supplier)
+                        
+                        # 👇 Send an automated In-App Welcome Notification
+                        welcome_alert = Notification(
+                            user_id=target_user.id,
+                            title="Account Activated",
+                            message="Welcome to the VMI Portal! Your supplier account is active. You will receive inventory alerts here."
+                        )
+                        db.session.add(welcome_alert)
 
                 db.session.commit()
                 return jsonify({"message": f"User {target_user.first_name} has been approved."}), 200
@@ -1535,6 +1572,12 @@ def approve_user():
                     linked_contractor = Contractor.query.filter_by(phone=target_user.phoneno).first()
                     if linked_contractor:
                         linked_contractor.department_id = target_user.department_id
+                        
+                # 👇 NEW: Update the Supplier department if they changed departments
+                elif target_user.role == 'SUPPLIER':
+                    linked_supplier = Supplier.query.filter_by(phone_number=target_user.phoneno).first()
+                    if linked_supplier:
+                        linked_supplier.department_id = target_user.department_id
 
                 db.session.commit()
                 return jsonify({"message": f"Department change for {target_user.first_name} has been approved."}), 200
@@ -1543,7 +1586,7 @@ def approve_user():
                 return jsonify({"error": "User is already approved"}), 400
         
         else:
-            # Rejection Logic
+            # Rejection Logic (Remains identical)
             if target_user.approval_status == 'PENDING_SIGNUP':
                 db.session.delete(target_user)
                 db.session.commit()
@@ -1563,7 +1606,6 @@ def approve_user():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "Database operation failed", "details": str(e)}), 500
-    
 
 
 @core.route('/orders/<int:order_id>', methods=['DELETE'])
@@ -1602,6 +1644,7 @@ def get_users():
 
     # Pass is_admin=True so the frontend gets the payroll configuration data
     return jsonify([user.to_dict(is_admin=True) for user in users]), 200
+
 @core.route('/transactions', methods=['GET'])
 @jwt_required
 @admin_only
@@ -1609,19 +1652,44 @@ def get_transactions():
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
     search_term = request.args.get('search', '').strip()
-    active_dept = get_active_department()
+    
+    view_all = request.args.get('view_all', 'false').lower() == 'true'
+    
+    # 👇 1. Grab sorting parameters from the frontend
+    sort_by = request.args.get('sort_by', 'product')
+    sort_order = request.args.get('sort_order', 'asc')
+
+    header_dept = request.headers.get('X-Department-Id')
+    active_dept = int(header_dept) if header_dept and header_dept.isdigit() else get_active_department()
 
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
 
-    query = Product.query.filter_by(is_active=True, department_id=active_dept)
+    query = Product.query.filter_by(is_active=True)
+    
+    if not view_all:
+        query = query.filter_by(department_id=active_dept)
+        
     if search_term:
         query = query.filter(or_(
             Product.name.ilike(f"%{search_term}%"),
             Product.product_code.ilike(f"%{search_term}%")
         ))
 
-    pagination = query.order_by(Product.name.asc()).paginate(page=page, per_page=per_page, error_out=False)
+    # 👇 2. Apply Dynamic Sorting (Product Name or SKU only)
+    if sort_by == 'sku':
+        order_col = Product.product_code
+    else:
+        from sqlalchemy import func
+        order_col = func.lower(Product.name) # Use lower() for accurate alphabetical sorting
+
+    if sort_order == 'desc':
+        query = query.order_by(order_col.desc(), Product.id.desc())
+    else:
+        query = query.order_by(order_col.asc(), Product.id.asc())
+
+    # 👇 3. Execute pagination
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
     products = pagination.items
 
     if not products:
@@ -1630,11 +1698,17 @@ def get_transactions():
     product_ids = [p.id for p in products]
     product_map = {p.id: p for p in products}
 
-    txn_query = Transaction.query.filter(
+    # 👇 4. Base Transaction Query
+    txn_filters = [
         Transaction.is_active == True,
-        Transaction.department_id == active_dept,
         Transaction.product_id.in_(product_ids)
-    )
+    ]
+    
+    # 👇 5. ONLY filter transactions by department if view_all is FALSE
+    if not view_all:
+        txn_filters.append(Transaction.department_id == active_dept)
+
+    txn_query = Transaction.query.filter(*txn_filters)
 
     if start_str and end_str:
         try:
@@ -1670,6 +1744,7 @@ def get_transactions():
             "product_id": p.id,
             "product": p.name,
             "sku": p.product_code,
+            "department_id": p.department_id,  # 👈 Crucial so your frontend knows where this came from!
             "total_in": tallies[p.id]['t_in'],
             "total_out": tallies[p.id]['t_out'],
             "return_in": tallies[p.id]['r_in'],
@@ -1680,6 +1755,7 @@ def get_transactions():
         "data": results,
         "pagination": { "page": page, "per_page": per_page, "total": pagination.total, "pages": pagination.pages }
     }), 200
+
 
 from flask import Response
 
@@ -2412,6 +2488,28 @@ def add_employee():
         )
         
         db.session.add(new_user)
+        db.session.flush() # 👇 Call flush so we get the new_user.id before committing
+
+        # 👇 NEW: Auto-create Supplier profile if Admin chose the SUPPLIER role
+        if new_user.role == 'SUPPLIER':
+            existing_sup = Supplier.query.filter_by(phone_number=new_user.phoneno).first()
+            if not existing_sup:
+                new_sup = Supplier(
+                    name=f"{new_user.first_name} {new_user.last_name}".strip(),
+                    phone_number=new_user.phoneno,
+                    department_id=new_user.department_id,
+                    is_active=True
+                )
+                db.session.add(new_sup)
+                
+                # Send the Welcome Notification
+                welcome_alert = Notification(
+                    user_id=new_user.id,
+                    title="Account Created",
+                    message="Welcome to the VMI Portal! Your supplier account has been configured by an Admin."
+                )
+                db.session.add(welcome_alert)
+
         db.session.commit()
         
         return jsonify({
@@ -2661,6 +2759,8 @@ def get_suppliers():
         suppliers = Supplier.query.filter_by(is_active=True, department_id=active_dept).all()
     
     return jsonify([s.to_dict() for s in suppliers]), 200
+
+
 @core.route('/suppliers/<int:id>', methods=['PUT'])
 @jwt_required
 @admin_only
@@ -3643,7 +3743,8 @@ def get_product_transactions(id):
     start_str = request.args.get('start_date')
     end_str = request.args.get('end_date')
     search_term = request.args.get('search', '').strip()
-    sort_order = request.args.get('sort', 'desc').strip().lower()
+    sort_by = request.args.get('sort_by', 'date').strip().lower()
+    sort_order = request.args.get('sort_order', 'desc').strip().lower()
 
     query = Transaction.query.options(
         joinedload(Transaction.product),
@@ -3683,11 +3784,20 @@ def get_product_transactions(id):
             )
         ))
 
-    if sort_order == 'asc':
-        query = query.order_by(Transaction.created_at.asc(), Transaction.id.asc())
+    if sort_by == 'qty':
+        order_col = Transaction.quantity
+    elif sort_by == 'entity':
+        # Smart sorting: Combines Supplier name, Contractor name, or defaults to Manual
+        order_col = func.coalesce(Supplier.name, Contractor.name, "Manual Adjustment")
     else:
-        query = query.order_by(Transaction.created_at.desc(), Transaction.id.desc())
+        order_col = Transaction.created_at
 
+    if sort_order == 'asc':
+        query = query.order_by(order_col.asc(), Transaction.id.asc())
+    else:
+        query = query.order_by(order_col.desc(), Transaction.id.desc())
+
+    # 👇 Execute pagination
     paginated = query.paginate(page=page, per_page=per_page, error_out=False)
 
     results = []

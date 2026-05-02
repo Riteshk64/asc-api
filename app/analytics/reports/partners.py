@@ -6,7 +6,6 @@ from app.models.contractor import Contractor
 
 # -----------------------------
 # Top Suppliers (IN)
-# OPTIMIZED: Use indexed columns
 # -----------------------------
 def get_top_suppliers(filters):
     in_filters = filters + [
@@ -14,17 +13,17 @@ def get_top_suppliers(filters):
         Transaction.supplier_id != None
     ]
 
+    # 👇 Removed .limit(5)
     results = db.session.query(
         Supplier.name,
         func.sum(Transaction.quantity).label('qty')
-    ).join(Transaction, Transaction.supplier_id == Supplier.id).filter(*in_filters).group_by(Supplier.id, Supplier.name).order_by(desc('qty')).limit(5).all()
+    ).join(Transaction, Transaction.supplier_id == Supplier.id).filter(*in_filters).group_by(Supplier.id, Supplier.name).order_by(desc('qty')).all()
 
     return [{"name": r.name, "qty": float(r.qty or 0)} for r in results]
 
 
 # -----------------------------
 # Top Contractors (OUT)
-# OPTIMIZED: Use indexed columns
 # -----------------------------
 def get_top_contractors(filters):
     out_filters = filters + [
@@ -32,9 +31,10 @@ def get_top_contractors(filters):
         Transaction.contractor_id != None
     ]
 
+    # 👇 Removed .limit(5)
     results = db.session.query(
         Contractor.name,
         func.sum(Transaction.quantity).label('qty')
-    ).join(Transaction, Transaction.contractor_id == Contractor.id).filter(*out_filters).group_by(Contractor.id, Contractor.name).order_by(desc('qty')).limit(5).all()
+    ).join(Transaction, Transaction.contractor_id == Contractor.id).filter(*out_filters).group_by(Contractor.id, Contractor.name).order_by(desc('qty')).all()
 
     return [{"name": r.name, "qty": float(r.qty or 0)} for r in results]
