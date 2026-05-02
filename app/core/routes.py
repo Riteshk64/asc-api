@@ -2577,12 +2577,45 @@ def update_employee(id):
             # Allow clearing department if needed (though rare for workers)
             user.department_id = None
 
+    # 👇 NEW: 5. Auto-Create Profiles if Role was Changed
     try:
+        if user.role == 'SUPPLIER':
+            existing_sup = Supplier.query.filter_by(phone_number=user.phoneno).first()
+            if not existing_sup:
+                new_sup = Supplier(
+                    name=f"{user.first_name} {user.last_name}".strip(),
+                    phone_number=user.phoneno,
+                    department_id=user.department_id,
+                    is_active=True
+                )
+                db.session.add(new_sup)
+                
+                # Send the Welcome Notification
+                welcome_alert = Notification(
+                    user_id=user.id,
+                    title="Account Configured",
+                    message="Your account has been updated to a Supplier profile by an Admin. Welcome to the VMI Portal!"
+                )
+                db.session.add(welcome_alert)
+
+        elif user.role == 'CLIENT':
+            existing_contractor = Contractor.query.filter_by(phone=user.phoneno).first()
+            if not existing_contractor:
+                new_contractor = Contractor(
+                    name=f"{user.first_name} {user.last_name}".strip(),
+                    phone=user.phoneno,
+                    department_id=user.department_id,
+                    is_active=True
+                )
+                db.session.add(new_contractor)
+
         db.session.commit()
         return jsonify({"message": "Worker updated successfully"}), 200
+
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
     
 @core.route('/departments/<int:id>', methods=['GET'])
 @jwt_required

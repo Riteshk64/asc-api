@@ -125,7 +125,7 @@ class User(db.Model):
             "is_active": self.is_active,
             "approval_status": self.approval_status,
             "requested_department_id": self.requested_department_id,
-            "permissions": derived_permissions  # 👈 Expose it to the frontend!
+            "permissions": derived_permissions
         }
 
         if is_admin:
