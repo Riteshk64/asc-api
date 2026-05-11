@@ -2856,7 +2856,6 @@ def get_contractors():
          contractors = Contractor.query.filter_by(is_active=True, department_id=active_dept).all()
     
     return jsonify([c.to_dict() for c in contractors]), 200
-
 @core.route('/contractors', methods=['POST'])
 @jwt_required
 def add_contractor():
@@ -2866,19 +2865,25 @@ def add_contractor():
     if not active_dept:
         return jsonify({"error": "Department context missing"}), 400
 
+    # 1. Validate Name
     name = data.get('name')
     if not name or not str(name).strip():
         return jsonify({"error": "Contractor Name is required and cannot be empty."}), 400
     name = str(name).strip()
 
+    # 2. Strictly Enforce 10-Digit Rule (Clean spaces/dashes safely)
     phone = data.get('phone')
     clean_phone = None
-    if phone:
+    if phone and str(phone).strip():
+        # Keep ONLY digits
         clean_phone = ''.join(filter(str.isdigit, str(phone)))
+        
+        # If it's not exactly 10 digits, reject cleanly
         if len(clean_phone) != 10:
-            return jsonify({"error": "Phone number must be exactly 10 digits"}), 400
+            return jsonify({"error": "Phone number must be exactly 10 digits."}), 400
 
     try:
+        # 3. Check for Existing Contractor (Prevent duplicate crashes)
         existing = Contractor.query.filter(
             Contractor.name.ilike(name), 
             Contractor.department_id == active_dept
@@ -2886,9 +2891,10 @@ def add_contractor():
         
         if existing:
             if not existing.is_active:
-                 return jsonify({"error": "Contractor exists but is in Recycle Bin. Restore it instead."}), 400
-            return jsonify({"error": "Contractor already exists"}), 400
+                 return jsonify({"error": f"Contractor '{existing.name}' exists but is in the Recycle Bin. Please restore it from settings."}), 400
+            return jsonify({"error": f"Contractor '{existing.name}' already exists in this department."}), 400
 
+        # 4. Save New Contractor safely
         new_contractor = Contractor(
             name=name,
             phone=clean_phone, 
@@ -2907,7 +2913,7 @@ def add_contractor():
         db.session.rollback()
         return jsonify({"error": "Failed to add contractor", "details": str(e)}), 500
     
-
+    
 @core.route('/contractor-transactions', methods=['GET'])
 @jwt_required
 def contractor_transaction_report():
