@@ -1228,7 +1228,10 @@ def get_contractors():
             Order.contractor_id.in_(contractor_ids), 
             Order.status == 'PENDING', 
             or_(Order.is_active == True, Order.is_active == None), 
-            Order.order_date < cutoff_date
+            or_(
+    Order.required_date < date.today(), 
+    and_(Order.order_date < cutoff_date, Order.required_date == None)
+)
         ).distinct().all()
         overdue_contractor_ids = {row[0] for row in overdue_orders}
     
@@ -4042,10 +4045,6 @@ from app.models.order import Order, OrderItem
 @jwt_required
 @admin_only
 def fulfill_contractor_order(order_id):
-    """
-    Fulfills the order by creating standard 'Out' transactions 
-    under this contractor, attaching the Challan ID.
-    """
     data = request.get_json()
     order = Order.query.get_or_404(order_id)
     challan_id = data.get('challan_id', '').strip()
@@ -4053,45 +4052,67 @@ def fulfill_contractor_order(order_id):
     if not challan_id:
         return jsonify({"error": "Challan ID is required for fulfillment"}), 400
 
+    # Safely map the payload. Fallback to 0 if anything is weird.
+    dispatch_data = {int(item['item_id']): float(item.get('dispatch_qty', 0)) for item in data.get('items', [])}
+
     try:
-        all_fulfilled = True
+        total_pending_remaining = 0
         
         for item in order.items:
-            pending = item.quantity - item.dispatched_qty
-            if pending <= 0: continue
+            dispatch_qty = dispatch_data.get(item.id, 0.0)
+            
+            # Safe fallback if the database has 'None' for older items
+            current_dispatched = item.dispatched_qty or 0.0
+            pending = item.quantity - current_dispatched
+            
+            # If no dispatch for this item, add its pending to the total and skip
+            if dispatch_qty <= 0:
+                total_pending_remaining += pending
+                continue
+
+            if dispatch_qty > pending:
+                return jsonify({"error": f"Cannot dispatch {dispatch_qty}. Only {pending} pending for {item.product.name}."}), 400
             
             # 1. Deduct Stock
             product = item.product
             eff_unit = get_effective_unit(product)
-            product.current_stock = calculate_new_stock(product.current_stock, pending, eff_unit, is_adding=False)
+            product.current_stock = calculate_new_stock(product.current_stock, dispatch_qty, eff_unit, is_adding=False)
             
             # 2. Update Order Item Status
-            item.dispatched_qty += pending
+            item.dispatched_qty = current_dispatched + dispatch_qty
             
             # 3. Create the official Transaction record (The Challan)
+            # CRITICAL FIX: Ensure quantity is set to dispatch_qty, not pending!
             txn = Transaction(
                 product_id=product.id,
+                order_id=order.id,
                 type='out',
-                quantity=pending,
+                quantity=dispatch_qty, 
                 contractor_id=order.contractor_id,
                 department_id=order.department_id,
                 created_by=g.current_user.id,
                 is_active=True,
                 challan_id=challan_id,
-                notes=f"Auto-fulfilled from Order #{order.id}"
+                notes=f"Partial dispatch from Order #{order.id}" if dispatch_qty < pending else f"Final dispatch from Order #{order.id}"
             )
             db.session.add(txn)
             db.session.add(product)
+            
+            # Add whatever is left over to the running total
+            total_pending_remaining += (pending - dispatch_qty)
 
-        order.status = 'FULFILLED'
+        # 4. Update Master Order Status
+        if total_pending_remaining <= 0:
+            order.status = 'FULFILLED'
+        elif total_pending_remaining < sum(i.quantity for i in order.items):
+            order.status = 'PARTIAL'
+
         db.session.commit()
-        return jsonify({"message": "Order fulfilled and Challan generated!"}), 200
+        return jsonify({"message": "Dispatch successful and Challan generated!"}), 200
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500  
-
-
+        return jsonify({"error": str(e)}), 500
 @core.route('/admin/orders', methods=['GET'])
 @jwt_required
 @admin_only
@@ -4179,40 +4200,91 @@ def get_client_products():
     products = query.order_by(Product.name.asc()).limit(50).all()
     return jsonify([p.to_dict() for p in products]), 200
 
-
 @core.route('/client/orders', methods=['POST'])
 @jwt_required
 def place_client_order():
     """CLIENT: Submits a new pending order from the cart."""
-    if g.role != 'CLIENT': return jsonify({"error": "Unauthorized"}), 403
-    data = request.get_json()
-    
-    contractor = Contractor.query.filter_by(phone=g.current_user.phoneno).first()
-    if not contractor: return jsonify({"error": "Contractor profile not found"}), 404
+    if g.role != 'CLIENT':
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json(force=True) or {}
+
+    contractor = Contractor.query.filter_by(
+        phone=g.current_user.phoneno
+    ).first()
+
+    if not contractor:
+        return jsonify({"error": "Contractor profile not found"}), 404
 
     try:
+        # ------------------------------------------------------------
+        # Your frontend is sending:
+        # {
+        #   "items": {
+        #       "items": [
+        #           {"product_id": 1468, "qty": 800}
+        #       ],
+        #       "required_date": "2026-05-20"
+        #   }
+        # }
+        #
+        # So the actual payload is nested inside data["items"].
+        # ------------------------------------------------------------
+
+        # Extract the real payload
+        payload = data.get('items', {})
+
+        # Extract order items
+        items = payload.get('items', [])
+
+        # Extract required date
+        required_date = None
+        required_date_str = payload.get('required_date')
+
+        if required_date_str:
+            required_date = datetime.strptime(
+                required_date_str,
+                '%Y-%m-%d'
+            ).date()
+
+        # Validate items
+        if not isinstance(items, list) or len(items) == 0:
+            return jsonify({
+                "error": "No items provided",
+                "received": data
+            }), 400
+
+        # Create order header
         new_order = Order(
-            contractor_id=contractor.id, 
-            department_id=contractor.department_id, 
-            status='PENDING'
+            contractor_id=contractor.id,
+            department_id=contractor.department_id,
+            status='PENDING',
+            required_date=required_date
         )
         db.session.add(new_order)
         db.session.flush()
 
-        for item in data.get('items', []):
+        # Create order items
+        for item in items:
             order_item = OrderItem(
-                order_id=new_order.id, 
-                product_id=item['product_id'], 
-                quantity=float(item['qty'])
+                order_id=new_order.id,
+                product_id=int(item['product_id']),
+                quantity=float(item['qty'])  # Stored in PCS
             )
             db.session.add(order_item)
 
         db.session.commit()
-        return jsonify({"message": "Order placed successfully!"}), 201
+
+        return jsonify({
+            "message": "Order placed successfully!",
+            "order_id": new_order.id
+        }), 201
+
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 @core.route('/client/orders', methods=['GET'])
 @jwt_required

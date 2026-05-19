@@ -12,7 +12,7 @@ class Transaction(db.Model):
     # Linked Entities
     supplier_id = db.Column(db.Integer, db.ForeignKey('suppliers.id'), nullable=True)
     contractor_id = db.Column(db.Integer, db.ForeignKey('contractors.id'), nullable=True)
-    
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=True)
     type = db.Column(db.String(10), nullable=False) # IN, OUT
     quantity = db.Column(db.Float, nullable=False)
     
@@ -27,6 +27,7 @@ class Transaction(db.Model):
     supplier = db.relationship('Supplier', lazy='joined')
     contractor = db.relationship('Contractor', lazy='joined')
     user = db.relationship('User', lazy='joined')
+    
 
     def to_dict(self):
         entity = "Adjustment"
@@ -37,6 +38,7 @@ class Transaction(db.Model):
             "id": self.id, 
             "product": self.product.name if self.product else "Unknown",
             "sku": self.product.product_code if self.product else "",
+            
             "type": self.type, 
             "qty": self.quantity,
             "entity": entity, 
