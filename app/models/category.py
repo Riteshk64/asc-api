@@ -4,7 +4,6 @@ class Category(db.Model):
     __tablename__ = 'categories'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), unique=True, nullable=False)
-    # 👆 Higher numbers go lower in the PDF
     display_order = db.Column(db.Integer, default=0) 
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
     

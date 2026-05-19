@@ -15,6 +15,7 @@ class Product(db.Model):
     unit = db.Column(db.String(20), default='pcs')
     category_id = db.Column(db.Integer, db.ForeignKey('categories.id'), nullable=True)
     sub_category_id = db.Column(db.Integer, db.ForeignKey('sub_categories.id'), nullable=True)
+    pcs_per_box = db.Column(db.Integer, default=100)
 
     def to_dict(self):
         return {
@@ -26,6 +27,8 @@ class Product(db.Model):
             "min_stock": self.min_stock,  
             "max_stock": self.max_stock, 
             "unit": self.unit, 
+            "pcs_per_box": self.pcs_per_box,
+            
             "category_id": self.category_id,
             "category_name": self.category_rel.name if self.category_rel else "OTHER",
             "sub_category_id": self.sub_category_id,

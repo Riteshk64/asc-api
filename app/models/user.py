@@ -80,6 +80,7 @@ class User(db.Model):
     requested_department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True)
     is_active = db.Column(db.Boolean, default=True) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    device_id = db.Column(db.String(255), nullable=True)
 
     # --- NEW: ROBUST PAYROLL MAPPING ---
     attendance_id = db.Column(db.String(50), unique=True, index=True, nullable=True)
@@ -90,6 +91,11 @@ class User(db.Model):
     
     overtime_eligible = db.Column(db.Boolean, default=False)
     overtime_rate = db.Column(db.Float, default=0.0) 
+    trusted_devices = db.Column(db.Text, default="") 
+    trusted_device_names = db.Column(db.Text, default="") # 👈 NEW: "iPhone 14, Windows Chrome"
+    
+    pending_device_id = db.Column(db.String(255), nullable=True) 
+    pending_device_name = db.Column(db.String(255), nullable=True)
 
     # Relationships
     attendance_records = db.relationship(
@@ -135,7 +141,10 @@ class User(db.Model):
                 "daily_required_hours": self.daily_required_hours,
                 "overtime_eligible": self.overtime_eligible,
                 "overtime_rate": self.overtime_rate,
-                "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S')
+                "created_at": self.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                "pending_device_name": self.pending_device_name, 
+                "trusted_device_names": self.trusted_device_names
             })
+            
         
         return data

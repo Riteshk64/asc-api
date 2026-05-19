@@ -6,6 +6,8 @@ from app.extensions import db
 from app.models.department import Department
 from app.auth.jwt_middleware import jwt_required
 from flask import g
+from app.models.contractor import Contractor
+from app.models.supplier import Supplier
 
 auth = Blueprint('auth', __name__, url_prefix='/auth')
 
@@ -66,13 +68,20 @@ def get_current_user():
         "requested_department_id": user.requested_department_id
     }), 200
 
+
+
+from app.models.contractor import Contractor
+from app.models.supplier import Supplier
+
 @auth.route("/verify-phone", methods=["POST"])
 def verify_phone():
     data = request.get_json()
     firebase_token = data.get("firebase_token")
+    device_id = data.get("device_id") 
+    device_name = data.get("device_name", "Unknown Device")
 
-    if not firebase_token:
-        return jsonify({"success": False, "message": "Token required"}), 400
+    if not firebase_token or not device_id:
+        return jsonify({"success": False, "message": "Tokens required."}), 400
 
     try:
         decoded = verify_firebase_token(firebase_token)
@@ -83,40 +92,82 @@ def verify_phone():
     user = User.query.filter_by(phoneno=phone).first()
 
     if not user:
-        user = User(
-            phoneno=phone,
-            is_active=False,
-            role='USER',  
-            approval_status='PENDING_SIGNUP' # Starts here
-        )
+        existing_contractor = Contractor.query.filter_by(phone=phone).first()
+        existing_supplier = Supplier.query.filter_by(phone_number=phone).first()
+
+        if existing_contractor:
+            user = User(
+                first_name=existing_contractor.name, phoneno=phone, role='CLIENT',
+                department_id=existing_contractor.department_id, is_active=False,
+                approval_status='PENDING_SIGNUP', 
+                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
+            )
+        elif existing_supplier:
+            user = User(
+                first_name=existing_supplier.name, phoneno=phone, role='SUPPLIER',
+                department_id=existing_supplier.department_id, is_active=False,
+                approval_status='PENDING_SIGNUP', 
+                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
+            )
+        else:
+            user = User(
+                phoneno=phone, is_active=False, role='USER',  
+                approval_status='PENDING_SIGNUP', 
+                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
+            )
+            
         db.session.add(user)
         db.session.commit()
-    
-        g.current_user = user
-        g.user_id = user.id
-        g.role = user.role
-        g.department_id = user.department_id
-        current_app.logger.info("request_started")
+    else:
+        # --- EXISTING USER LOGIN ATTEMPT ---
+        
+        # 1. LEGACY DEVICE MIGRATOR (Safely removes None strings)
+        old_device = str(user.device_id or "").strip()
+        if old_device and old_device != "None" and not user.trusted_devices:
+            user.trusted_devices = old_device
+            user.trusted_device_names = "Original Device"
+            db.session.commit()
 
-    # 2. PROFILE IS COMPLETE ONLY IF THEY HAVE A NAME
+        # 2. BULLETPROOF FIREWALL CHECK
+        trusted_str = str(user.trusted_devices or "")
+        # Splits by comma and perfectly trims every single ID to prevent space mismatches
+        trusted_list = [d.strip() for d in trusted_str.split(',') if d.strip()]
+        
+        current_device = str(device_id or "").strip()
+
+        if current_device and current_device not in trusted_list and user.role != 'ADMIN':
+            # THE FIREWALL: Unrecognized Device!
+            user.pending_device_id = current_device
+            user.pending_device_name = str(device_name or "Unknown Device").strip()
+            user.approval_status = 'PENDING_NEW_DEVICE'
+            user.is_active = False 
+            db.session.commit()
+            
+        elif user.approval_status == 'PENDING_NEW_DEVICE' and current_device in trusted_list:
+            # 🛡️ THE AUTO-UNLOCK FAILSAFE: 
+            # If they got locked out on a new laptop, but log in again on their original trusted phone, UNFREEZE them!
+            user.approval_status = 'APPROVED'
+            user.is_active = True
+            user.pending_device_id = None
+            user.pending_device_name = None
+            db.session.commit()
+
+    g.current_user = user
+    g.user_id = user.id
+    g.role = user.role
+    g.department_id = user.department_id
+
     is_profile_done = bool(user.first_name and user.department_id)
-
-    # 3. ISSUE A REAL TOKEN WITH A USER ID
     token = generate_jwt(
-        {
-            "user_id": user.id,
-            "role": user.role,
-            "department_id": user.department_id,
-        },
+        {"user_id": user.id, "role": user.role, "department_id": user.department_id},
         expires_in_minutes=60 * 24 * 7 
     )
 
     return jsonify({
-        "token": token,
-        "profile_complete": is_profile_done,
-        "is_active": user.is_active,
-        "role": user.role
+        "token": token, "profile_complete": is_profile_done,
+        "is_active": user.is_active, "role": user.role
     }), 200
+
 
 @auth.route("/create-profile", methods=["POST"])
 @jwt_required 
