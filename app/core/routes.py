@@ -303,142 +303,7 @@ def get_clients():
     
     return jsonify([client.to_dict() for client in clients]), 200
 
-@core.route('/orders/place', methods=['POST'])
-@jwt_required
-def place_order():
-    """Client places a new order tied strictly to their department"""
-    if g.role != 'CLIENT':
-        return jsonify({"error": "Only registered clients can place orders"}), 403
 
-    data = request.get_json()
-    items = data.get('items', [])
-    
-    if not items:
-        return jsonify({"error": "Order cannot be empty"}), 400
-
-    try:
-        # 👇 STRICT LOCK: The order is forced into the Client's assigned department
-        client_dept_id = g.current_user.department_id
-        
-        if not client_dept_id:
-            return jsonify({"error": "Your client profile is not assigned to a department. Please contact support."}), 400
-
-        new_order = Order(
-            user_id=g.current_user.id,
-            department_id=client_dept_id, # 👈 Tied permanently to the client's dept
-            notes=data.get('notes', ''),
-            status='PENDING'
-        )
-        db.session.add(new_order)
-        db.session.flush()
-
-        # Add the items... (rest of the logic remains exactly the same as above)
-        for item in items:
-            order_item = OrderItem(
-                order_id=new_order.id,
-                product_id=item['product_id'],
-                ordered_qty=float(item['qty'])
-            )
-            db.session.add(order_item)
-
-        db.session.commit()
-        return jsonify({"message": "Order placed successfully!", "order_id": new_order.id}), 201
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-@core.route('/orders/my-orders', methods=['GET'])
-@jwt_required
-def get_my_orders():
-    """Client views their own order history"""
-    orders = Order.query.filter_by(user_id=g.current_user.id).order_by(desc(Order.created_at)).all()
-    return jsonify([o.to_dict() for o in orders]), 200
-
-
-@core.route('/orders', methods=['GET'])
-@jwt_required
-def get_all_orders():
-    """Company views all pending/fulfilled orders"""
-    active_dept = get_active_department()
-    
-    query = Order.query
-    # If it's a worker, only show orders meant for their department
-    if g.role != 'ADMIN' and active_dept:
-        query = query.filter_by(department_id=active_dept)
-        
-    orders = query.order_by(desc(Order.created_at)).all()
-    return jsonify([o.to_dict() for o in orders]), 200
-
-
-@core.route('/orders/<int:order_id>/fulfill', methods=['POST'])
-@jwt_required
-def fulfill_order(order_id):
-    """
-    The Magic Bridge: Approves the order, deducts stock, and creates 
-    official stock-out transactions under the Client's Contractor profile.
-    """
-    # Requires standard permissions check here based on your decorators
-    active_dept = get_active_department()
-    
-    order = Order.query.get(order_id)
-    if not order:
-        return jsonify({"error": "Order not found"}), 404
-        
-    if order.status == 'FULFILLED':
-        return jsonify({"error": "Order is already fulfilled"}), 400
-
-    client_user = order.user
-
-    try:
-        # 1. SMART LINK: Find or Create a 'Contractor/Client' profile using the User's Phone
-        # This keeps your existing Inventory Transaction history perfectly clean.
-        client_profile = Contractor.query.filter_by(phone=client_user.phoneno).first()
-        if not client_profile:
-            client_profile = Contractor(
-                name=f"{client_user.first_name} {client_user.last_name}".strip(),
-                phone=client_user.phoneno,
-                department_id=order.department_id or active_dept,
-                is_active=True
-            )
-            db.session.add(client_profile)
-            db.session.flush()
-
-        # 2. Process Inventory for each item
-        for item in order.items:
-            product = item.product
-            eff_unit = get_effective_unit(product)
-
-            # Check if we have enough stock!
-            if product.current_stock < item.quantity:
-                raise Exception(f"Insufficient stock for {product.name}. Have: {product.current_stock}, Need: {item.quantity}")
-
-            # Deduct Stock
-            product.current_stock = calculate_new_stock(product.current_stock, item.quantity, eff_unit, is_adding=False)
-            
-            # Log the official Transaction
-            txn = Transaction(
-                product_id=product.id, 
-                type='out', 
-                quantity=item.quantity,
-                contractor_id=client_profile.id, # Tied safely to the client
-                department_id=product.department_id, 
-                created_by=g.current_user.id, 
-                is_active=True,
-                notes=f"Auto-fulfilled from Order #{order.id}"
-            )
-            db.session.add(txn)
-            db.session.add(product)
-
-        # 3. Mark the Order as complete
-        order.status = 'FULFILLED'
-        db.session.commit()
-
-        return jsonify({"message": "Order fulfilled and inventory updated!"}), 200
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 400
 
 
 @core.route('/stock/operate', methods=['POST'])
@@ -1147,35 +1012,6 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 
 
-@core.route('/contractors/<int:id>', methods=['PUT'])
-@jwt_required
-def update_contractor(id):
-    contractor = Contractor.query.get(id)
-    if not contractor:
-        return jsonify({"error": "Contractor not found"}), 404
-
-    data = request.get_json()
-    
-    # 🛡️ VALIDATE NAME
-    if 'name' in data: 
-        new_name = data['name']
-        if not new_name or not str(new_name).strip():
-            return jsonify({"error": "Contractor name cannot be empty."}), 400
-        contractor.name = str(new_name).strip()
-
-    # 👇 ADDED: Update Phone and Department ID
-    if 'phone' in data: 
-        contractor.phone = data['phone'] 
-        
-    if 'department_id' in data and data['department_id']:
-        contractor.department_id = int(data['department_id'])
-
-    try:
-        db.session.commit()
-        return jsonify({"message": "Contractor updated"}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
 
 @core.route('/products', methods=['GET'])
 @jwt_required
@@ -1307,6 +1143,176 @@ def get_products():
         }
     }), 200
 
+
+
+@core.route('/orders/<int:order_id>', methods=['DELETE'])
+@jwt_required
+@admin_only
+def delete_admin_order(order_id):
+    order = Order.query.get_or_404(order_id)
+    order.is_active = False # 👈 Soft Delete (Sends to Recycle Bin)
+    db.session.commit()
+    return jsonify({"message": "Order moved to Recycle Bin"}), 200
+
+
+from datetime import date, timedelta
+from sqlalchemy import func
+
+@core.route('/analysis/production', methods=['GET'])
+@jwt_required
+def production_analysis():
+    active_dept = get_active_department()
+    months = request.args.get('months', 1, type=int)
+
+    # Calculate cutoff date based on the time filter (1M, 3M, 6M, 9M, 12M)
+    cutoff_date = date.today() - timedelta(days=30 * months)
+
+    # 1. Get all active products
+    products = Product.query.filter_by(department_id=active_dept, is_active=True).all()
+
+    # 2. Get SUM of all pending order items within the date range
+    pending_items = db.session.query(
+        OrderItem.product_id,
+        func.sum(OrderItem.quantity).label('total_ordered')
+    ).join(Order).filter(
+        Order.status == 'PENDING',
+        Order.is_active == True,
+        Order.department_id == active_dept,
+        Order.order_date >= cutoff_date
+    ).group_by(OrderItem.product_id).all()
+
+    ordered_map = {pid: total for pid, total in pending_items}
+
+    results = []
+    for p in products:
+        order_qty = ordered_map.get(p.id, 0)
+        
+        # Only show items that actually have pending orders
+        if order_qty > 0:
+            # Formula: To Produce = Order Qty - Stock Available (Minimum 0)
+            to_produce = max(0, order_qty - p.current_stock)
+            
+            results.append({
+                "id": p.id,
+                "code": p.product_code,
+                "name": p.name,
+                "order_qty": float(order_qty),
+                "in_stock": float(p.current_stock),
+                "to_produce": float(to_produce)
+            })
+
+    # Sort so the highest "To Produce" is at the top
+    results.sort(key=lambda x: x['to_produce'], reverse=True)
+    return jsonify(results), 200
+
+from sqlalchemy import or_
+from datetime import date, timedelta
+
+@core.route('/contractors', methods=['GET'])
+@jwt_required
+def get_contractors():
+    active_dept = get_active_department() 
+    if g.role == "ADMIN" and not active_dept:
+         contractors = Contractor.query.filter_by(is_active=True).all()
+    else:
+         contractors = Contractor.query.filter_by(is_active=True, department_id=active_dept).all()
+    
+    # 👇 THE OPTIMIZATION: Fixes the N+1 Slowness 
+    cutoff_date = date.today() - timedelta(days=30)
+    contractor_ids = [c.id for c in contractors]
+    
+    overdue_contractor_ids = set()
+    if contractor_ids:
+        # Ask the database ONCE for all overdue orders matching these contractors
+        overdue_orders = db.session.query(Order.contractor_id).filter(
+            Order.contractor_id.in_(contractor_ids), 
+            Order.status == 'PENDING', 
+            or_(Order.is_active == True, Order.is_active == None), 
+            Order.order_date < cutoff_date
+        ).distinct().all()
+        overdue_contractor_ids = {row[0] for row in overdue_orders}
+    
+    results = []
+    for c in contractors:
+        c_dict = c.to_dict()
+        c_dict['has_overdue'] = c.id in overdue_contractor_ids
+        results.append(c_dict)
+        
+    return jsonify(results), 200
+
+@core.route('/contractors/<int:id>', methods=['PUT'])
+@jwt_required
+def update_contractor(id):
+    contractor = Contractor.query.get(id)
+    if not contractor: return jsonify({"error": "Contractor not found"}), 404
+
+    data = request.get_json()
+    if 'name' in data: contractor.name = str(data['name']).strip()
+    if 'phone' in data: contractor.phone = data['phone'] 
+    
+    if 'department_id' in data and data['department_id']:
+        new_dept = int(data['department_id'])
+        # If shifted to a new department, permanently nuke pending orders
+        if contractor.department_id != new_dept:
+            Order.query.filter_by(contractor_id=contractor.id, status='PENDING').delete()
+            
+        contractor.department_id = new_dept
+
+    try:
+        db.session.commit()
+        return jsonify({"message": "Contractor updated"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500   
+
+@core.route('/contractors/<int:id>/orders', methods=['GET'])
+@jwt_required
+def get_contractor_orders(id):
+    active_dept = get_active_department()
+    query = Order.query.filter(
+        Order.contractor_id == id, 
+        or_(Order.is_active == True, Order.is_active == None)
+    ) 
+    if active_dept:
+        query = query.filter(Order.department_id == active_dept)
+        
+    orders = query.order_by(Order.created_at.desc()).all()
+    return jsonify([o.to_dict() for o in orders]), 200
+
+
+
+@core.route('/orders/<int:order_id>', methods=['PUT'])
+@jwt_required
+@admin_only
+def edit_admin_order(order_id):
+    order = Order.query.get_or_404(order_id)
+    data = request.get_json()
+
+    try:
+        # 1. Update basic info & Increment Counter
+        order.challan_number = data.get('challan_number', order.challan_number)
+        if data.get('order_date'):
+            order.order_date = datetime.strptime(data['order_date'], '%Y-%m-%d').date()
+        
+        order.edit_counter += 1
+
+        # 2. Rebuild the cart (Delete old, insert new)
+        if 'items' in data and len(data['items']) > 0:
+            OrderItem.query.filter_by(order_id=order.id).delete()
+            for item in data['items']:
+                db.session.add(OrderItem(
+                    order_id=order.id,
+                    product_id=item['product_id'],
+                    quantity=float(item['qty']) 
+                ))
+
+        db.session.commit()
+        return jsonify({"message": "Order updated successfully!"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500    
+
 @core.route('/products/search', methods=['GET'])
 @jwt_required
 def search_products():
@@ -1360,105 +1366,145 @@ def search_products():
 #         db.session.rollback()
 #         return jsonify({"error": str(e)}), 500
 
+# @core.route('/products/<int:id>', methods=['PUT'])
+# @jwt_required
+# def update_product(id):
+#     try:
+#         product = Product.query.get(id)
+#         if not product: 
+#             return jsonify({"error": "Product not found"}), 404
+
+#         active_dept = get_active_department()
+#         if g.role != 'ADMIN' and product.department_id != active_dept:
+#             return jsonify({"error": "Unauthorized"}), 403
+
+#         data = request.get_json()
+        
+#         # 🛡️ VALIDATE NAME
+#         if 'name' in data:
+#             new_name = data['name']
+#             if not new_name or not str(new_name).strip():
+#                 return jsonify({"error": "Product name cannot be empty."}), 400
+#             product.name = str(new_name).strip()
+
+#         # 🛡️ VALIDATE SKU
+#         if 'sku' in data:
+#             new_sku = data['sku']
+#             if not new_sku or not str(new_sku).strip():
+#                 return jsonify({"error": "Product SKU cannot be empty."}), 400
+#             new_sku = str(new_sku).strip()
+#             if new_sku != product.product_code:
+#                 product.product_code = new_sku
+        
+#         # 🛑 VALIDATE MIN STOCK (No Negatives)
+#         if 'min_stock' in data: 
+#             try: 
+#                 val = data['min_stock']
+#                 if val == "" or val is None:
+#                     product.min_stock = 0.0
+#                 else:
+#                     parsed_val = float(val)
+#                     if parsed_val < 0: return jsonify({"error": "Min stock cannot be negative."}), 400
+#                     product.min_stock = parsed_val
+#             except ValueError: 
+#                 return jsonify({"error": "Invalid number for min stock."}), 400
+#         if 'pcs_per_box' in data:
+#             product.pcs_per_box = int(data['pcs_per_box'])    
+        
+#         # 🛑 VALIDATE MAX STOCK (No Negatives)
+#         if 'max_stock' in data:
+#             try: 
+#                 val = data['max_stock']
+#                 if val == "" or val is None:
+#                     product.max_stock = 0.0
+#                 else:
+#                     parsed_val = float(val)
+#                     if parsed_val < 0: return jsonify({"error": "Max stock cannot be negative."}), 400
+#                     product.max_stock = parsed_val
+#             except ValueError: 
+#                 return jsonify({"error": "Invalid number for max stock."}), 400 
+
+#         if 'category_name' in data:
+#             # Clean the input, default to 'OTHER' if they send an empty string
+#             cat_name = data['category_name'].strip().upper()
+#             if not cat_name:
+#                 cat_name = 'OTHER'
+                
+#             # Find or create the category within this specific department
+#             category = Category.query.filter_by(name=cat_name, department_id=active_dept).first()
+#             if not category:
+#                 max_order = db.session.query(func.max(Category.display_order)).filter_by(department_id=active_dept).scalar()
+#                 next_order = (max_order or 0) + 1
+#                 category = Category(name=cat_name, display_order=next_order, department_id=active_dept)
+#                 db.session.add(category)
+#                 db.session.flush()
+                
+#             # 👇 CRITICAL FIX: Actually assign the ID to the product!
+#             product.category_id = category.id
+
+#         if 'sub_category_name' in data:
+#             # Clean the input, default to 'GENERAL' if they send an empty string
+#             sub_name = data['sub_category_name'].strip().upper()
+#             if not sub_name:
+#                 sub_name = 'GENERAL'
+                
+#             # Find or create the sub-category within this specific department
+#             sub_category = SubCategory.query.filter_by(name=sub_name, department_id=active_dept).first()
+#             if not sub_category:
+#                 max_sub_order = db.session.query(func.max(SubCategory.display_order)).filter_by(department_id=active_dept).scalar()
+#                 next_sub_order = (max_sub_order or 0) + 1
+#                 sub_category = SubCategory(name=sub_name, display_order=next_sub_order, department_id=active_dept)
+#                 db.session.add(sub_category)
+#                 db.session.flush()
+                
+#             # 👇 CRITICAL FIX: Actually assign the ID to the product!
+#             product.sub_category_id = sub_category.id
+
+#         db.session.commit()
+#         return jsonify({"message": "Product updated"}), 200
+
+#     except Exception as e:
+#         db.session.rollback()
+#         print(f"Update Product Error: {str(e)}") 
+#         return jsonify({"error": f"Server Error: {str(e)}"}), 500
+
+
 @core.route('/products/<int:id>', methods=['PUT'])
 @jwt_required
 def update_product(id):
+    product = Product.query.get_or_404(id)
+    active_dept = get_active_department()
+    if g.role != 'ADMIN' and product.department_id != active_dept:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json()
     try:
-        product = Product.query.get(id)
-        if not product: 
-            return jsonify({"error": "Product not found"}), 404
+        if 'name' in data: product.name = str(data['name']).strip()
+        if 'sku' in data: product.product_code = str(data['sku']).strip()
+        if 'min_stock' in data: product.min_stock = float(data['min_stock'])
+        if 'max_stock' in data: product.max_stock = float(data['max_stock'])
+        if 'pcs_per_box' in data: product.pcs_per_box = int(data['pcs_per_box'])
 
-        active_dept = get_active_department()
-        if g.role != 'ADMIN' and product.department_id != active_dept:
-            return jsonify({"error": "Unauthorized"}), 403
-
-        data = request.get_json()
-        
-        # 🛡️ VALIDATE NAME
-        if 'name' in data:
-            new_name = data['name']
-            if not new_name or not str(new_name).strip():
-                return jsonify({"error": "Product name cannot be empty."}), 400
-            product.name = str(new_name).strip()
-
-        # 🛡️ VALIDATE SKU
-        if 'sku' in data:
-            new_sku = data['sku']
-            if not new_sku or not str(new_sku).strip():
-                return jsonify({"error": "Product SKU cannot be empty."}), 400
-            new_sku = str(new_sku).strip()
-            if new_sku != product.product_code:
-                product.product_code = new_sku
-        
-        # 🛑 VALIDATE MIN STOCK (No Negatives)
-        if 'min_stock' in data: 
-            try: 
-                val = data['min_stock']
-                if val == "" or val is None:
-                    product.min_stock = 0.0
-                else:
-                    parsed_val = float(val)
-                    if parsed_val < 0: return jsonify({"error": "Min stock cannot be negative."}), 400
-                    product.min_stock = parsed_val
-            except ValueError: 
-                return jsonify({"error": "Invalid number for min stock."}), 400
-        
-        # 🛑 VALIDATE MAX STOCK (No Negatives)
-        if 'max_stock' in data:
-            try: 
-                val = data['max_stock']
-                if val == "" or val is None:
-                    product.max_stock = 0.0
-                else:
-                    parsed_val = float(val)
-                    if parsed_val < 0: return jsonify({"error": "Max stock cannot be negative."}), 400
-                    product.max_stock = parsed_val
-            except ValueError: 
-                return jsonify({"error": "Invalid number for max stock."}), 400 
-
-        if 'category_name' in data:
-            # Clean the input, default to 'OTHER' if they send an empty string
-            cat_name = data['category_name'].strip().upper()
-            if not cat_name:
-                cat_name = 'OTHER'
+        # Update Category/Sub by name (namespaced by dept)
+        for field, model in [('category_name', Category), ('sub_category_name', SubCategory)]:
+            if field in data:
+                name = data[field].strip().upper() or ('OTHER' if field == 'category_name' else 'GENERAL')
+                obj = model.query.filter_by(name=name, department_id=active_dept).first()
+                if not obj:
+                    max_ord = db.session.query(func.max(model.display_order)).filter_by(department_id=active_dept).scalar() or 0
+                    obj = model(name=name, display_order=max_ord + 1, department_id=active_dept)
+                    db.session.add(obj)
+                    db.session.flush()
                 
-            # Find or create the category within this specific department
-            category = Category.query.filter_by(name=cat_name, department_id=active_dept).first()
-            if not category:
-                max_order = db.session.query(func.max(Category.display_order)).filter_by(department_id=active_dept).scalar()
-                next_order = (max_order or 0) + 1
-                category = Category(name=cat_name, display_order=next_order, department_id=active_dept)
-                db.session.add(category)
-                db.session.flush()
-                
-            # 👇 CRITICAL FIX: Actually assign the ID to the product!
-            product.category_id = category.id
-
-        if 'sub_category_name' in data:
-            # Clean the input, default to 'GENERAL' if they send an empty string
-            sub_name = data['sub_category_name'].strip().upper()
-            if not sub_name:
-                sub_name = 'GENERAL'
-                
-            # Find or create the sub-category within this specific department
-            sub_category = SubCategory.query.filter_by(name=sub_name, department_id=active_dept).first()
-            if not sub_category:
-                max_sub_order = db.session.query(func.max(SubCategory.display_order)).filter_by(department_id=active_dept).scalar()
-                next_sub_order = (max_sub_order or 0) + 1
-                sub_category = SubCategory(name=sub_name, display_order=next_sub_order, department_id=active_dept)
-                db.session.add(sub_category)
-                db.session.flush()
-                
-            # 👇 CRITICAL FIX: Actually assign the ID to the product!
-            product.sub_category_id = sub_category.id
+                if field == 'category_name': product.category_id = obj.id
+                else: product.sub_category_id = obj.id
 
         db.session.commit()
         return jsonify({"message": "Product updated"}), 200
-
     except Exception as e:
         db.session.rollback()
-        print(f"Update Product Error: {str(e)}") 
-        return jsonify({"error": f"Server Error: {str(e)}"}), 500
+        return jsonify({"error": "Update failed", "details": str(e)}), 500
+
 
 @core.route('/pending-users', methods=['GET'])
 @jwt_required
@@ -1467,7 +1513,6 @@ def get_pending_users():
     active_dept = get_active_department()
     
     query = User.query.filter(User.approval_status != 'APPROVED', User.role != 'ADMIN')
-    
     if active_dept:
         query = query.filter(User.department_id == active_dept)
         
@@ -1479,50 +1524,43 @@ def get_pending_users():
         user_dict['approval_status'] = user.approval_status
         user_dict['requested_department_id'] = user.requested_department_id
         
-        # For current department
+        # 👇 FORCE INJECTION just in case your User.to_dict() method missed them
+        user_dict['trusted_device_names'] = getattr(user, 'trusted_device_names', "None registered")
+        user_dict['pending_device_name'] = getattr(user, 'pending_device_name', "Unknown Device")
+        
         if user.department_id:
             dept = Department.query.get(user.department_id)
             user_dict['department_name'] = dept.name if dept else "Unknown"
         
-        # For requested department (dept change case)
         if user.requested_department_id:
             req_dept = Department.query.get(user.requested_department_id)
             user_dict['requested_department_name'] = req_dept.name if req_dept else "Unknown"
         
         results.append(user_dict)
         
-    return jsonify(results), 200   
-    
+    return jsonify(results), 200
+
+
 @core.route('/approve-user', methods=['POST'])
 @jwt_required
+@admin_only
 def approve_user():
     data = request.get_json()
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
-
     target_user_id = data.get('id')
-    phone = data.get('phone')
     is_approved = data.get('approved')
 
-    if target_user_id is None or phone is None or is_approved is None:
-        return jsonify({
-            "error": "Missing required fields (id, phone, approved)",
-            "received": data 
-        }), 400
-
-    target_user = User.query.filter_by(id=target_user_id, phoneno=phone).first()
-
-    if not target_user:
-        return jsonify({"error": "Pending user not found or phone number mismatch"}), 404
+    # 👇 1. FIND BY ID ONLY. Phone numbers cause silent mismatches.
+    target_user = User.query.get(target_user_id)
+    
+    if not target_user: 
+        return jsonify({"error": "User not found"}), 404
 
     try:
         if is_approved:
-            # CASE 1: New Signup Approval
             if target_user.approval_status == 'PENDING_SIGNUP':
                 target_user.is_active = True
                 target_user.approval_status = 'APPROVED'
                 
-                # Automatically create a Contractor profile if they are a CLIENT
                 if target_user.role == 'CLIENT':
                     existing_contractor = Contractor.query.filter_by(phone=target_user.phoneno).first()
                     if not existing_contractor:
@@ -1534,7 +1572,6 @@ def approve_user():
                         )
                         db.session.add(new_contractor)
 
-                # 👇 NEW: Automatically create a Supplier profile if they are a SUPPLIER
                 elif target_user.role == 'SUPPLIER':
                     existing_supplier = Supplier.query.filter_by(phone_number=target_user.phoneno).first()
                     if not existing_supplier:
@@ -1546,59 +1583,65 @@ def approve_user():
                         )
                         db.session.add(new_supplier)
                         
-                        # 👇 Send an automated In-App Welcome Notification
                         welcome_alert = Notification(
                             user_id=target_user.id,
                             title="Account Activated",
-                            message="Welcome to the VMI Portal! Your supplier account is active. You will receive inventory alerts here."
+                            message="Welcome to the VMI Portal!"
                         )
                         db.session.add(welcome_alert)
-
-                db.session.commit()
-                return jsonify({"message": f"User {target_user.first_name} has been approved."}), 200
-            
-            # CASE 2: Department Change Approval
-            elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
-                if not target_user.requested_department_id:
-                    return jsonify({"error": "No department change request found"}), 400
                 
+            elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
                 target_user.department_id = target_user.requested_department_id
                 target_user.requested_department_id = None
                 target_user.approval_status = 'APPROVED'
                 target_user.is_active = True
-                
-                # Update the Contractor department if they changed departments
-                if target_user.role == 'CLIENT':
-                    linked_contractor = Contractor.query.filter_by(phone=target_user.phoneno).first()
-                    if linked_contractor:
-                        linked_contractor.department_id = target_user.department_id
-                        
-                # 👇 NEW: Update the Supplier department if they changed departments
-                elif target_user.role == 'SUPPLIER':
-                    linked_supplier = Supplier.query.filter_by(phone_number=target_user.phoneno).first()
-                    if linked_supplier:
-                        linked_supplier.department_id = target_user.department_id
 
+            # 👇 CASE 3: BULLETPROOF NEW DEVICE APPROVAL
+            elif target_user.approval_status == 'PENDING_NEW_DEVICE':
+                new_dev = str(target_user.pending_device_id or "").strip()
+                new_name = str(target_user.pending_device_name or "Unknown").strip()
+                
+                trusted_str = str(target_user.trusted_devices or "").strip()
+                trusted_names_str = str(target_user.trusted_device_names or "").strip()
+                
+                if new_dev and new_dev not in trusted_str:
+                    target_user.trusted_devices = f"{trusted_str},{new_dev}" if trusted_str else new_dev
+                
+                if new_name and new_name not in trusted_names_str:
+                    target_user.trusted_device_names = f"{trusted_names_str}, {new_name}" if trusted_names_str else new_name
+                
+                target_user.pending_device_id = None
+                target_user.pending_device_name = None
+                target_user.approval_status = 'APPROVED'
+                target_user.is_active = True 
+                
                 db.session.commit()
-                return jsonify({"message": f"Department change for {target_user.first_name} has been approved."}), 200
-            
-            else:
-                return jsonify({"error": "User is already approved"}), 400
+                return jsonify({"message": f"New device approved for {target_user.first_name}."}), 200
+
+            db.session.commit()
+            return jsonify({"message": "Action approved"}), 200
         
         else:
-            # Rejection Logic (Remains identical)
+            # REJECTION LOGIC
             if target_user.approval_status == 'PENDING_SIGNUP':
                 db.session.delete(target_user)
                 db.session.commit()
-                return jsonify({"message": "User registration rejected and removed."}), 200
+                return jsonify({"message": "User registration rejected."}), 200
             
             elif target_user.approval_status == 'PENDING_DEPT_CHANGE':
                 target_user.requested_department_id = None
                 target_user.approval_status = 'APPROVED'
                 target_user.is_active = True 
-                
                 db.session.commit()
-                return jsonify({"message": "Department change rejected. User reverted to original department."}), 200
+                return jsonify({"message": "Department change rejected."}), 200
+
+            elif target_user.approval_status == 'PENDING_NEW_DEVICE':
+                target_user.pending_device_id = None
+                target_user.pending_device_name = None
+                target_user.approval_status = 'APPROVED' 
+                target_user.is_active = True 
+                db.session.commit()
+                return jsonify({"message": "New device blocked. Original devices restored."}), 200
             
             else:
                 return jsonify({"error": "Cannot reject already approved user"}), 400
@@ -1606,24 +1649,6 @@ def approve_user():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "Database operation failed", "details": str(e)}), 500
-
-
-@core.route('/orders/<int:order_id>', methods=['DELETE'])
-@jwt_required
-@admin_only
-def delete_order(order_id):
-    order = Order.query.get(order_id)
-    if not order:
-        return jsonify({"error": "Order not found"}), 404
-        
-    try:
-        db.session.delete(order)
-        db.session.commit()
-        return jsonify({"message": "Order deleted successfully"}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-    
 
 @core.route('/users', methods=['GET'])
 @jwt_required
@@ -1840,11 +1865,18 @@ def export_products_json():
         eff_unit = get_effective_unit(p)
         current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
 
+        eff_unit = get_effective_unit(p)
+        # Calculate the net movement for the selected dates
+        period_net = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
+
         groups[cat_name][sub_name].append({
             "code": p.product_code or '-', "name": p.name or '-',
-            "in": tallies[p.id]['t_in'], "out": tallies[p.id]['t_out'], "stock": current_stock,
-            "min_stock": p.min_stock, # 👈 ADD THIS
-            "max_stock": p.max_stock  # 👈 ADD THIS
+            "in": tallies[p.id]['t_in'], 
+            "out": tallies[p.id]['t_out'], 
+            "period_stock": period_net,      # 👈 The date-filtered stock
+            "live_stock": p.current_stock,   # 👈 The actual shelf stock
+            "min_stock": p.min_stock, 
+            "max_stock": p.max_stock  
         })
 
     export_data = []
@@ -1919,17 +1951,18 @@ def export_products_csv():
     products.sort(key=get_sort_keys)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Stock'])
+    writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Period Net', 'Live Stock'])
 
     for p in products:
         if is_custom_range and not tallies[p.id]['has_activity']: continue
         eff_unit = get_effective_unit(p)
-        current_stock = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
+        period_net = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
         
+        # Add the Live Stock column at the end
         writer.writerow([
             p.category_rel.name if p.category_rel else 'OTHER',
             p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
-            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], current_stock
+            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], period_net, p.current_stock
         ])
 
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
@@ -2429,27 +2462,27 @@ def get_all_employees():
     employees = User.query.all()
     results = []
 
-    
     for w in employees:
-
         if w.department_id is None and w.role == "ADMIN":
             continue
 
-        dept_name = Department.query.filter_by(id = w.department_id).first()
+        dept = Department.query.filter_by(id=w.department_id).first()
         results.append({
             "id": w.id,
             "name": f"{w.first_name} {w.last_name}",
             "phone": w.phoneno,
             "role": w.role,
-            "department": dept_name.name,
+            "department": dept.name if dept else "Unknown",
             "department_id": w.department_id,
             "is_active": w.is_active,
             "approval_status": w.approval_status,
             "requested_department_id": w.requested_department_id,
-            "joined_at": w.created_at
+            "joined_at": w.created_at,
+            # 👇 EXPLICITLY SENDING THE DEVICE NAMES TO THE FRONTEND
+            "trusted_device_names": getattr(w, 'trusted_device_names', "None registered"),
+            "pending_device_name": getattr(w, 'pending_device_name', "Unknown Device")
         })
     return jsonify(results), 200
-
 @core.route('/departments', methods=['GET'])
 @jwt_required
 def get_departments():
@@ -2820,42 +2853,8 @@ def update_supplier(id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-# @core.route('/contractors/<int:id>', methods=['PUT'])
-# @jwt_required
-# def update_contractor(id):
-#     contractor = Contractor.query.get(id)
-#     if not contractor:
-#         return jsonify({"error": "Contractor not found"}), 404
-
-#     data = request.get_json()
-    
-#     # 🛡️ VALIDATE NAME
-#     if 'name' in data: 
-#         new_name = data['name']
-#         if not new_name or not str(new_name).strip():
-#             return jsonify({"error": "Contractor name cannot be empty."}), 400
-#         contractor.name = str(new_name).strip()
-
-#     try:
-#         db.session.commit()
-#         return jsonify({"message": "Contractor updated"}), 200
-#     except Exception as e:
-#         db.session.rollback()
-#         return jsonify({"error": str(e)}), 500
 
 
-
-@core.route('/contractors', methods=['GET'])
-@jwt_required
-def get_contractors():
-    active_dept = get_active_department() 
-    
-    if g.role == "ADMIN" and not active_dept:
-         contractors = Contractor.query.filter_by(is_active=True).all()
-    else:
-         contractors = Contractor.query.filter_by(is_active=True, department_id=active_dept).all()
-    
-    return jsonify([c.to_dict() for c in contractors]), 200
 @core.route('/contractors', methods=['POST'])
 @jwt_required
 def add_contractor():
@@ -2964,125 +2963,7 @@ def contractor_transaction_report():
 
 from sqlalchemy import func
 
-@core.route('/orders/demand', methods=['GET'])
-@jwt_required
-@admin_only
-def get_aggregated_demand():
-    """
-    Calculates total pending demand for every product across ALL pending client orders.
-    Example: Product A -> 20,000 ordered, 5,000 dispatched, 15,000 pending.
-    """
-    # Build the base query without forcing a specific department
-    query = db.session.query(
-        Product.id,
-        Product.name,
-        Product.product_code,
-        Product.unit,
-        Product.current_stock,
-        func.sum(OrderItem.ordered_qty).label('total_ordered'),
-        func.sum(OrderItem.dispatched_qty).label('total_dispatched')
-    ).join(OrderItem, OrderItem.product_id == Product.id)\
-     .join(Order, Order.id == OrderItem.order_id)\
-     .filter(Order.status.in_(['PENDING', 'PARTIALLY_DISPATCHED']))
 
-    # Execute the query grouping by product
-    demand = query.group_by(Product.id).all()
-
-    results = []
-    for d in demand:
-        # Safety check: replace None with 0 if sum is empty
-        tot_ordered = d.total_ordered or 0
-        tot_dispatched = d.total_dispatched or 0
-        pending = tot_ordered - tot_dispatched
-        
-        if pending > 0:
-            results.append({
-                "product_id": d.id,
-                "name": d.name,
-                "sku": d.product_code,
-                "unit": d.unit,
-                "current_stock": d.current_stock,
-                "total_ordered": tot_ordered,
-                "total_dispatched": tot_dispatched,
-                "total_pending": pending
-            })
-
-    return jsonify(results), 200
-
-
-@core.route('/orders/<int:order_id>/dispatch', methods=['POST'])
-@jwt_required
-@admin_only
-def dispatch_order(order_id):
-    """
-    Handles Partial or Full dispatch of an order.
-    Attaches Logistics info and safely deducts from inventory.
-    """
-    order = Order.query.get(order_id)
-    if not order: return jsonify({"error": "Order not found"}), 404
-
-    data = request.get_json()
-    dispatch_items = data.get('items', []) # [{"item_id": 1, "dispatch_qty": 500}]
-    
-    order.challan_number = data.get('challan_number')
-    order.lr_number = data.get('lr_number')
-    order.transport_details = data.get('transport_details')
-
-    # Find the Client's Contractor Profile (to log the transaction)
-    client_profile = Contractor.query.filter_by(phone=order.user.phoneno).first()
-    if not client_profile:
-        client_profile = Contractor(name=f"{order.user.first_name} {order.user.last_name}", phone=order.user.phoneno, is_active=True)
-        db.session.add(client_profile)
-        db.session.flush()
-
-    all_items_fulfilled = True
-
-    try:
-        for d_item in dispatch_items:
-            order_item = OrderItem.query.get(d_item['item_id'])
-            if not order_item or order_item.order_id != order.id: continue
-
-            dispatch_qty = float(d_item['dispatch_qty'])
-            if dispatch_qty <= 0:
-                # Still check if this item is completely fulfilled from previous dispatches
-                if order_item.dispatched_qty < order_item.ordered_qty: all_items_fulfilled = False
-                continue
-
-            product = order_item.product
-            eff_unit = get_effective_unit(product)
-
-            # 1. Deduct Stock using your brasspart-safe function
-            product.current_stock = calculate_new_stock(product.current_stock, dispatch_qty, eff_unit, is_adding=False)
-            
-            # 2. Update Order Item
-            order_item.dispatched_qty += dispatch_qty
-
-            # 3. Create the official Transaction Log
-            txn = Transaction(
-                product_id=product.id, type='out', quantity=dispatch_qty,
-                contractor_id=client_profile.id, department_id=product.department_id,
-                created_by=g.current_user.id, is_active=True,
-                notes=f"Dispatched via LR: {order.lr_number} | Transport: {order.transport_details}",
-                challan_id=order.challan_number
-            )
-            db.session.add(txn)
-            db.session.add(product)
-
-            if order_item.dispatched_qty < order_item.ordered_qty:
-                all_items_fulfilled = False
-
-    
-        if all_items_fulfilled:
-            order.status = 'FULFILLED'
-        else:
-            order.status = 'PARTIALLY_DISPATCHED'
-
-        db.session.commit()
-        return jsonify({"message": "Dispatch successful!", "status": order.status}), 200
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500        
 @core.route('/categories', methods=['GET'])
 @jwt_required
 def get_categories():
@@ -3422,80 +3303,128 @@ def delete_sub_category(sub_id):
     
 #     return jsonify({"message": "Product added successfully"}), 201
 
+# @core.route('/products', methods=['POST'])
+# @jwt_required
+# def add_product():
+#     data = request.get_json()
+#     active_dept = get_active_department()
+
+#     if not active_dept:
+#         return jsonify({"error": "Department context missing"}), 400
+        
+#     # 🛡️ VALIDATE NAMES
+#     product_name = data.get('name')
+#     if not product_name or not str(product_name).strip():
+#         return jsonify({"error": "Product Name is required and cannot be empty."}), 400
+#     product_name = str(product_name).strip()
+        
+#     sku = data.get('product_code', data.get('sku'))
+#     if not sku or not str(sku).strip():
+#         return jsonify({"error": "Product SKU is required."}), 400
+#     sku = str(sku).strip()
+
+#     # VALIDATE NUMBERS (No Negatives!)
+#     try:
+#         qty = float(data.get('qty', 0))
+#         min_stock = float(data.get('min_stock', 10))
+#         max_stock = float(data.get('max_stock', 100))
+        
+#         if qty < 0 or min_stock < 0 or max_stock < 0:
+#             return jsonify({"error": "Quantities and stock limits cannot be negative."}), 400
+#     except (ValueError, TypeError):
+#         return jsonify({"error": "Invalid numeric values provided."}), 400
+
+#     try:
+#         # 👇 UPDATE THIS IN BOTH ADD_PRODUCT and UPDATE_PRODUCT
+#         cat_name = data.get('category_name', 'OTHER').strip().upper()
+#         # Notice we are now filtering by active_dept too!
+#         category = Category.query.filter_by(name=cat_name, department_id=active_dept).first()
+#         if not category:
+#             max_order = db.session.query(func.max(Category.display_order)).filter_by(department_id=active_dept).scalar()
+#             next_order = (max_order or 0) + 1
+#             # Pass the active_dept when creating!
+#             category = Category(name=cat_name, display_order=next_order, department_id=active_dept)
+#             db.session.add(category)
+#             db.session.flush()
+
+#         sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
+#         sub_category = SubCategory.query.filter_by(name=sub_name, department_id=active_dept).first()
+#         if not sub_category:
+#             max_sub_order = db.session.query(func.max(SubCategory.display_order)).filter_by(department_id=active_dept).scalar()
+#             next_sub_order = (max_sub_order or 0) + 1
+#             # Pass the active_dept when creating!
+#             sub_category = SubCategory(name=sub_name, display_order=next_sub_order, department_id=active_dept)
+#             db.session.add(sub_category)
+#             db.session.flush()
+
+#         new_product = Product(
+#             name=product_name,
+#             product_code=sku,
+#             category_rel=category,       
+#             sub_category_rel=sub_category, 
+#             department_id=active_dept,
+#             current_stock=qty,
+#             min_stock=min_stock,
+#             max_stock=max_stock,
+#             unit=data.get('unit', 'pcs'),
+#             pcs_per_box=int(data.get('pcs_per_box', 100))
+#         )
+        
+#         db.session.add(new_product)
+#         db.session.commit() 
+        
+#         return jsonify({"message": "Product added successfully", "id": new_product.id}), 201
+
+#     except Exception as e:
+#         db.session.rollback() 
+#         return jsonify({"error": "Server error while adding product", "details": str(e)}), 500
+    
+
 @core.route('/products', methods=['POST'])
 @jwt_required
 def add_product():
     data = request.get_json()
     active_dept = get_active_department()
-
-    if not active_dept:
-        return jsonify({"error": "Department context missing"}), 400
+    if not active_dept: return jsonify({"error": "Department context missing"}), 400
         
-    # 🛡️ VALIDATE NAMES
-    product_name = data.get('name')
-    if not product_name or not str(product_name).strip():
-        return jsonify({"error": "Product Name is required and cannot be empty."}), 400
-    product_name = str(product_name).strip()
-        
-    sku = data.get('product_code', data.get('sku'))
-    if not sku or not str(sku).strip():
-        return jsonify({"error": "Product SKU is required."}), 400
-    sku = str(sku).strip()
-
-    # VALIDATE NUMBERS (No Negatives!)
-    try:
-        qty = float(data.get('qty', 0))
-        min_stock = float(data.get('min_stock', 10))
-        max_stock = float(data.get('max_stock', 100))
-        
-        if qty < 0 or min_stock < 0 or max_stock < 0:
-            return jsonify({"error": "Quantities and stock limits cannot be negative."}), 400
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid numeric values provided."}), 400
+    product_name = str(data.get('name', '')).strip()
+    sku = str(data.get('product_code', data.get('sku', ''))).strip()
+    if not product_name or not sku:
+        return jsonify({"error": "Name and SKU are required."}), 400
 
     try:
-        # 👇 UPDATE THIS IN BOTH ADD_PRODUCT and UPDATE_PRODUCT
+        # Category Helper
         cat_name = data.get('category_name', 'OTHER').strip().upper()
-        # Notice we are now filtering by active_dept too!
         category = Category.query.filter_by(name=cat_name, department_id=active_dept).first()
         if not category:
-            max_order = db.session.query(func.max(Category.display_order)).filter_by(department_id=active_dept).scalar()
-            next_order = (max_order or 0) + 1
-            # Pass the active_dept when creating!
-            category = Category(name=cat_name, display_order=next_order, department_id=active_dept)
+            max_order = db.session.query(func.max(Category.display_order)).filter_by(department_id=active_dept).scalar() or 0
+            category = Category(name=cat_name, display_order=max_order + 1, department_id=active_dept)
             db.session.add(category)
             db.session.flush()
 
+        # SubCategory Helper
         sub_name = data.get('sub_category_name', 'GENERAL').strip().upper()
         sub_category = SubCategory.query.filter_by(name=sub_name, department_id=active_dept).first()
         if not sub_category:
-            max_sub_order = db.session.query(func.max(SubCategory.display_order)).filter_by(department_id=active_dept).scalar()
-            next_sub_order = (max_sub_order or 0) + 1
-            # Pass the active_dept when creating!
-            sub_category = SubCategory(name=sub_name, display_order=next_sub_order, department_id=active_dept)
+            max_sub_order = db.session.query(func.max(SubCategory.display_order)).filter_by(department_id=active_dept).scalar() or 0
+            sub_category = SubCategory(name=sub_name, display_order=max_sub_order + 1, department_id=active_dept)
             db.session.add(sub_category)
             db.session.flush()
 
         new_product = Product(
-            name=product_name,
-            product_code=sku,
-            category_rel=category,       
-            sub_category_rel=sub_category, 
-            department_id=active_dept,
-            current_stock=qty,
-            min_stock=min_stock,
-            max_stock=max_stock,
-            unit=data.get('unit', 'pcs')
+            name=product_name, product_code=sku, category_rel=category,       
+            sub_category_rel=sub_category, department_id=active_dept,
+            current_stock=float(data.get('qty', 0)),
+            min_stock=float(data.get('min_stock', 10)),
+            max_stock=float(data.get('max_stock', 100)),
+            unit=data.get('unit', 'pcs'), pcs_per_box=int(data.get('pcs_per_box', 100))
         )
-        
         db.session.add(new_product)
         db.session.commit() 
-        
-        return jsonify({"message": "Product added successfully", "id": new_product.id}), 201
-
+        return jsonify({"message": "Product added", "id": new_product.id}), 201
     except Exception as e:
-        db.session.rollback() 
-        return jsonify({"error": "Server error while adding product", "details": str(e)}), 500
+        db.session.rollback()
+        return jsonify({"error": "Add failed", "details": str(e)}), 500
     
 @core.route('/products/<int:id>', methods=['DELETE'])
 @jwt_required
@@ -4043,7 +3972,6 @@ def get_my_vmi_dashboard():
         }
     }), 200
 
-
 @core.route('/system/trigger-vmi-alerts', methods=['POST'])
 @jwt_required
 @admin_only
@@ -4105,3 +4033,226 @@ def mark_notification_read(notif_id):
     notif.is_read = True
     db.session.commit()
     return jsonify({"message": "Marked as read"}), 200
+
+
+
+from app.models.order import Order, OrderItem
+
+@core.route('/orders/<int:order_id>/fulfill', methods=['POST'])
+@jwt_required
+@admin_only
+def fulfill_contractor_order(order_id):
+    """
+    Fulfills the order by creating standard 'Out' transactions 
+    under this contractor, attaching the Challan ID.
+    """
+    data = request.get_json()
+    order = Order.query.get_or_404(order_id)
+    challan_id = data.get('challan_id', '').strip()
+    
+    if not challan_id:
+        return jsonify({"error": "Challan ID is required for fulfillment"}), 400
+
+    try:
+        all_fulfilled = True
+        
+        for item in order.items:
+            pending = item.quantity - item.dispatched_qty
+            if pending <= 0: continue
+            
+            # 1. Deduct Stock
+            product = item.product
+            eff_unit = get_effective_unit(product)
+            product.current_stock = calculate_new_stock(product.current_stock, pending, eff_unit, is_adding=False)
+            
+            # 2. Update Order Item Status
+            item.dispatched_qty += pending
+            
+            # 3. Create the official Transaction record (The Challan)
+            txn = Transaction(
+                product_id=product.id,
+                type='out',
+                quantity=pending,
+                contractor_id=order.contractor_id,
+                department_id=order.department_id,
+                created_by=g.current_user.id,
+                is_active=True,
+                challan_id=challan_id,
+                notes=f"Auto-fulfilled from Order #{order.id}"
+            )
+            db.session.add(txn)
+            db.session.add(product)
+
+        order.status = 'FULFILLED'
+        db.session.commit()
+        return jsonify({"message": "Order fulfilled and Challan generated!"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500  
+
+
+@core.route('/admin/orders', methods=['GET'])
+@jwt_required
+@admin_only
+def get_admin_orders():
+    active_dept = get_active_department()
+    query = Order.query.filter(or_(Order.is_active == True, Order.is_active == None))
+
+    if active_dept:
+        query = query.filter(Order.department_id == active_dept)
+
+    orders = query.order_by(Order.created_at.desc()).all()
+    results = []
+    for order in orders:
+        data = order.to_dict()
+        data['department_id'] = order.department_id
+        results.append(data)
+
+    return jsonify(results), 200
+
+
+@core.route('/admin/orders/place', methods=['POST'])
+@jwt_required
+@admin_only
+def admin_place_order():
+    """Admin manually places an order for a Contractor (Client)"""
+    data = request.get_json()
+    contractor_id = data.get('contractor_id')
+    active_dept = data.get('department_id') or get_active_department()
+    items = data.get('items', [])
+    
+    # 👇 NEW: Capture the Challan Number
+    challan_number = data.get('challan_number', '').strip()
+
+    if not contractor_id or not items:
+        return jsonify({"error": "Contractor and items are required"}), 400
+
+    try:
+        new_order = Order(
+            contractor_id=contractor_id,
+            department_id=active_dept,
+            challan_number=challan_number if challan_number else None, # 👈 Save it here
+            notes=data.get('notes', ''),
+            status='PENDING'
+        )
+        db.session.add(new_order)
+        db.session.flush()
+
+        for item in items:
+            order_item = OrderItem(
+                order_id=new_order.id,
+                product_id=item['product_id'],
+                quantity=float(item['qty']) 
+            )
+            db.session.add(order_item)
+
+        db.session.commit()
+        return jsonify({"message": "Order placed successfully!", "order_id": new_order.id}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500   
+
+
+#clients routes
+# ==========================================
+# 🚀 CLIENT PORTAL ROUTES
+# ==========================================
+
+@core.route('/client/products', methods=['GET'])
+@jwt_required
+def get_client_products():
+    """CLIENT: Fetches active products with dynamic search and a strict limit to prevent timeouts."""
+    if g.role != 'CLIENT': return jsonify({"error": "Unauthorized"}), 403
+    
+    search_term = request.args.get('search', '').strip()
+    query = Product.query.filter_by(department_id=g.current_user.department_id, is_active=True)
+    
+    if search_term:
+        query = query.filter(or_(
+            Product.name.ilike(f"%{search_term}%"),
+            Product.product_code.ilike(f"%{search_term}%")
+        ))
+        
+    # Limit to 50 to prevent frontend freezing/timeouts!
+    products = query.order_by(Product.name.asc()).limit(50).all()
+    return jsonify([p.to_dict() for p in products]), 200
+
+
+@core.route('/client/orders', methods=['POST'])
+@jwt_required
+def place_client_order():
+    """CLIENT: Submits a new pending order from the cart."""
+    if g.role != 'CLIENT': return jsonify({"error": "Unauthorized"}), 403
+    data = request.get_json()
+    
+    contractor = Contractor.query.filter_by(phone=g.current_user.phoneno).first()
+    if not contractor: return jsonify({"error": "Contractor profile not found"}), 404
+
+    try:
+        new_order = Order(
+            contractor_id=contractor.id, 
+            department_id=contractor.department_id, 
+            status='PENDING'
+        )
+        db.session.add(new_order)
+        db.session.flush()
+
+        for item in data.get('items', []):
+            order_item = OrderItem(
+                order_id=new_order.id, 
+                product_id=item['product_id'], 
+                quantity=float(item['qty'])
+            )
+            db.session.add(order_item)
+
+        db.session.commit()
+        return jsonify({"message": "Order placed successfully!"}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@core.route('/client/orders', methods=['GET'])
+@jwt_required
+def get_client_orders():
+    """CLIENT: Fetches their pending/active orders."""
+    if g.role != 'CLIENT': return jsonify({"error": "Unauthorized"}), 403
+    
+    contractor = Contractor.query.filter_by(phone=g.current_user.phoneno).first()
+    if not contractor: return jsonify([]), 200
+    
+    orders = Order.query.filter_by(
+        contractor_id=contractor.id, 
+        is_active=True
+    ).order_by(Order.created_at.desc()).all()
+    
+    return jsonify([o.to_dict() for o in orders]), 200
+
+
+@core.route('/client/dispatches', methods=['GET'])
+@jwt_required
+def get_client_dispatches():
+    """CLIENT: Fetches official dispatches (Stock Out transactions attached to their profile)."""
+    if g.role != 'CLIENT': return jsonify({"error": "Unauthorized"}), 403
+    
+    contractor = Contractor.query.filter_by(phone=g.current_user.phoneno).first()
+    if not contractor: return jsonify([]), 200
+    
+    # Dispatches are essentially "Stock Out" transactions assigned to this contractor
+    txns = Transaction.query.options(joinedload(Transaction.product)).filter_by(
+        contractor_id=contractor.id, 
+        type='out', 
+        is_active=True
+    ).order_by(Transaction.created_at.desc()).all()
+    
+    results = []
+    for t in txns:
+        t_dict = t.to_dict()
+        t_dict['product_name'] = t.product.name if t.product else "Unknown"
+        t_dict['sku'] = t.product.product_code if t.product else "Unknown"
+        t_dict['pcs_per_box'] = t.product.pcs_per_box if t.product else 100
+        results.append(t_dict)
+        
+    return jsonify(results), 200               
