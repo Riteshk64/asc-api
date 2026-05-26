@@ -3548,52 +3548,118 @@ def delete_contractor(id):
         return jsonify({"error": str(e)}), 500
 
 
+# @core.route('/contractors/<int:id>/stock', methods=['GET'])
+# @jwt_required
+# def get_contractor_stock(id):
+#     start_date = request.args.get('start_date')
+#     end_date = request.args.get('end_date')
+
+#     txn_query = Transaction.query.filter(Transaction.contractor_id == id, Transaction.is_active == True)
+#     if start_date and end_date:
+#         try:
+#             sd = datetime.strptime(start_date, '%Y-%m-%d')
+#             ed = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+#             txn_query = txn_query.filter(Transaction.created_at.between(sd, ed))
+#         except ValueError: pass
+
+#     transactions = txn_query.options(joinedload(Transaction.product)).all()
+    
+#     tallies = {}
+#     for txn in transactions:
+#         p = txn.product
+#         if not p or not p.is_active: continue
+        
+#         eff_unit = get_effective_unit(p)
+#         key = (p.id, txn.challan_id)
+        
+#         if key not in tallies:
+#             tallies[key] = {
+#                 "product_id": p.id, "product_name": p.name, "sku": p.product_code, "unit": eff_unit,
+#                 "department_id": p.department_id, "challan_id": txn.challan_id, "last_date": txn.created_at, "qty": 0.0
+#             }
+            
+#         if txn.created_at > tallies[key]["last_date"]:
+#             tallies[key]["last_date"] = txn.created_at
+            
+#         if txn.type == 'out':
+#             tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, True)
+#         elif txn.type == 'return':
+#             tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, False)
+
+#     stock_list = []
+#     for key, data in tallies.items():
+#         if data['qty'] > 0:
+#             data['date'] = data['last_date'].strftime('%Y-%m-%d')
+#             del data['last_date']
+#             stock_list.append(data)
+
+#     return jsonify(stock_list), 200
 @core.route('/contractors/<int:id>/stock', methods=['GET'])
 @jwt_required
 def get_contractor_stock(id):
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
 
-    txn_query = Transaction.query.filter(Transaction.contractor_id == id, Transaction.is_active == True)
+    txn_query = Transaction.query.filter(
+        Transaction.contractor_id == id,
+        Transaction.is_active == True
+    )
+
+    # Optional date filter
     if start_date and end_date:
         try:
             sd = datetime.strptime(start_date, '%Y-%m-%d')
-            ed = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-            txn_query = txn_query.filter(Transaction.created_at.between(sd, ed))
-        except ValueError: pass
+            ed = datetime.strptime(end_date, '%Y-%m-%d').replace(
+                hour=23,
+                minute=59,
+                second=59
+            )
 
-    transactions = txn_query.options(joinedload(Transaction.product)).all()
-    
-    tallies = {}
-    for txn in transactions:
-        p = txn.product
-        if not p or not p.is_active: continue
-        
-        eff_unit = get_effective_unit(p)
-        key = (p.id, txn.challan_id)
-        
-        if key not in tallies:
-            tallies[key] = {
-                "product_id": p.id, "product_name": p.name, "sku": p.product_code, "unit": eff_unit,
-                "department_id": p.department_id, "challan_id": txn.challan_id, "last_date": txn.created_at, "qty": 0.0
-            }
-            
-        if txn.created_at > tallies[key]["last_date"]:
-            tallies[key]["last_date"] = txn.created_at
-            
-        if txn.type == 'out':
-            tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, True)
-        elif txn.type == 'return':
-            tallies[key]['qty'] = calculate_new_stock(tallies[key]['qty'], txn.quantity, eff_unit, False)
+            txn_query = txn_query.filter(
+                Transaction.created_at.between(sd, ed)
+            )
+
+        except ValueError:
+            pass
+
+    print("NEW CONTRACTOR STOCK API RUNNING")
+
+    # Fetch transactions + product relation
+    transactions = txn_query.options(
+        joinedload(Transaction.product)
+    ).order_by(
+        Transaction.created_at.desc()
+    ).all()
 
     stock_list = []
-    for key, data in tallies.items():
-        if data['qty'] > 0:
-            data['date'] = data['last_date'].strftime('%Y-%m-%d')
-            del data['last_date']
-            stock_list.append(data)
+
+    for txn in transactions:
+        p = txn.product
+
+        # Skip deleted/inactive products
+        if not p or not p.is_active:
+            continue
+
+        stock_list.append({
+            "transaction_id": txn.id,
+            "product_id": p.id,
+            "product_name": p.name,
+            "sku": p.product_code,
+            "unit": p.unit or 'pcs',
+            "department_id": p.department_id,
+
+            "challan_id": txn.challan_id,
+            "notes": txn.notes or "",
+
+            "date": txn.created_at.strftime('%Y-%m-%d'),
+            "datetime": txn.created_at.isoformat(),
+
+            "qty": txn.quantity,
+            "type": txn.type
+        })
 
     return jsonify(stock_list), 200
+
 
 # @core.route("/suppliers/<int:id>/products", methods=["GET"])
 # @jwt_required
