@@ -1012,7 +1012,6 @@ def get_user_attendance_history(id):
 #     return jsonify([p.to_dict() for p in products]), 200
 
 
-
 @core.route('/products', methods=['GET'])
 @jwt_required
 def get_products():
@@ -1028,7 +1027,7 @@ def get_products():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("limit", 50, type=int), 100)
     
-    # 👇 1. Grab sorting parameters from the frontend
+    # 1. Grab sorting parameters from the frontend
     sort_by = request.args.get('sort_by', 'id')
     sort_order = request.args.get('sort_order', 'desc')
 
@@ -1054,9 +1053,8 @@ def get_products():
             Product.sub_category_id.in_([int(x) for x in sub_ids.split(',')])
         )
 
-    # 👇 2. Apply Dynamic Sorting
+    # 2. Apply Dynamic Sorting
     if sort_by == 'name':
-        # Use func.lower so 'apple' doesn't get sorted after 'Zebra'
         order_col = func.lower(Product.name)
     elif sort_by == 'qty':
         order_col = Product.current_stock
@@ -1064,20 +1062,45 @@ def get_products():
         order_col = Product.id
 
     if sort_order == 'asc':
-        # 👇 Notice we are using base_query and Product.id here!
         base_query = base_query.order_by(order_col.asc(), Product.id.asc())
     else:
         base_query = base_query.order_by(order_col.desc(), Product.id.desc())
 
-    # 👇 Execute pagination
+    # Execute pagination
     pagination = base_query.paginate(page=page, per_page=per_page, error_out=False)
     products = pagination.items
 
-    # NO DATE FILTER: Just return current_stock directly, zero transaction queries
+    product_ids = [p.id for p in products]
+    product_map = {p.id: p for p in products}
+
+    # NO DATE FILTER: Dynamically calculate stock using ONLY active transactions to prevent bloat
     if not start_str or not end_str:
+        # Fetch all active transactions for these products to compute true stock
+        live_transactions = Transaction.query.filter(
+            Transaction.is_active == True,
+            Transaction.department_id == active_dept,
+            Transaction.product_id.in_(product_ids)
+        ).all()
+
+        live_tallies = {pid: {'t_in': 0.0, 't_out': 0.0} for pid in product_ids}
+        for txn in live_transactions:
+            pid = txn.product_id
+            p = product_map[pid]
+            if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
+                live_tallies[pid]['t_in'] = calculate_new_stock(
+                    live_tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
+                )
+            elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
+                live_tallies[pid]['t_out'] = calculate_new_stock(
+                    live_tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
+                )
+
         data = []
         for p in products:
             p_dict = p.to_dict()
+            eff_unit = get_effective_unit(p)
+            # Override stale shelf stock with mathematically verified active transaction stock
+            p_dict['qty'] = calculate_new_stock(live_tallies[p.id]['t_in'], live_tallies[p.id]['t_out'], eff_unit, is_adding=False)
             p_dict['total_stock_in'] = None
             p_dict['total_stock_out'] = None
             data.append(p_dict)
@@ -1090,7 +1113,7 @@ def get_products():
             }
         }), 200
 
-    # DATE FILTER ACTIVE: Now we actually need to query transactions
+    # DATE FILTER ACTIVE: Query transactions within the bounding dates
     try:
         start_date = datetime.strptime(start_str, '%Y-%m-%d')
         end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(
@@ -1098,9 +1121,6 @@ def get_products():
         )
     except ValueError:
         return jsonify({"error": "Invalid date format"}), 400
-
-    product_ids = [p.id for p in products]
-    product_map = {p.id: p for p in products}
 
     transactions = Transaction.query.filter(
         Transaction.is_active == True,
@@ -1142,8 +1162,6 @@ def get_products():
             "total": pagination.total, "pages": pagination.pages
         }
     }), 200
-
-
 
 @core.route('/orders/<int:order_id>', methods=['DELETE'])
 @jwt_required
