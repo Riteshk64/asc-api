@@ -1285,8 +1285,15 @@ def export_products_json():
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
         cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
+        
         if cat_name not in sub_orders: sub_orders[cat_name] = {}
-        sub_orders[cat_name][sub_name] = cso_map.get((p.category_id, p.sub_category_id), 9999) if p.sub_category_id else 9999
+        
+        # 🚨 THE FIX: Check contextual order first, fallback to base sub-category order, then 9999
+        contextual_order = cso_map.get((p.category_id, p.sub_category_id))
+        base_sub_order = p.sub_category_rel.display_order if p.sub_category_rel else 9999
+        
+        sub_orders[cat_name][sub_name] = contextual_order if contextual_order is not None else base_sub_order
+        
         if cat_name not in groups: groups[cat_name] = {}
         if sub_name not in groups[cat_name]: groups[cat_name][sub_name] = []
 
@@ -1301,12 +1308,11 @@ def export_products_json():
             "code": p.product_code or '-', "name": p.name or '-',
             "in": tallies[p.id]['t_in'], 
             "out": tallies[p.id]['t_out'], 
-            "period_stock": period_net,      # 👈 The date-filtered stock
-            "live_stock": p.current_stock,   # 👈 The actual shelf stock
+            "period_stock": period_net,      
+            "live_stock": p.current_stock,   
             "min_stock": p.min_stock, 
             "max_stock": p.max_stock  
         })
-
     export_data = []
     sorted_cats = sorted(groups.keys(), key=lambda c: (cat_orders.get(c, 9999), c))
     for cat_name in sorted_cats:
@@ -1381,18 +1387,19 @@ def export_products_csv():
     writer = csv.writer(output)
     writer.writerow(['Category', 'Subcategory', 'Product Code', 'Product Name', 'In', 'Out', 'Period Net', 'Live Stock'])
 
-    for p in products:
-        if is_custom_range and not tallies[p.id]['has_activity']: continue
-        eff_unit = get_effective_unit(p)
-        period_net = calculate_new_stock(tallies[p.id]['t_in'], tallies[p.id]['t_out'], eff_unit, False) if is_custom_range else p.current_stock
+    def get_sort_keys(p):
+        cat_order = p.category_rel.display_order if p.category_rel else 9999
+        cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         
-        # Add the Live Stock column at the end
-        writer.writerow([
-            p.category_rel.name if p.category_rel else 'OTHER',
-            p.sub_category_rel.name if p.sub_category_rel else 'GENERAL',
-            p.product_code, p.name, tallies[p.id]['t_in'], tallies[p.id]['t_out'], period_net, p.current_stock
-        ])
-
+        # 🚨 THE FIX: Apply the same fallback logic here
+        contextual_order = cso_map.get((p.category_id, p.sub_category_id))
+        base_sub_order = p.sub_category_rel.display_order if p.sub_category_rel else 9999
+        sub_order = contextual_order if contextual_order is not None else base_sub_order
+        
+        sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
+        return (cat_order, cat_name, sub_order, sub_name, p.product_code or '')
+    
+    
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment;filename=inventory_report.csv"})
 
 import csv
