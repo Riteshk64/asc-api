@@ -1281,7 +1281,7 @@ def export_products_json():
     groups, cat_orders, sub_orders = {}, {}, {}
 
     for p in products:
-        if is_custom_range and not tallies[p.id]['has_activity']: continue
+        # if is_custom_range and not tallies[p.id]['has_activity']: continue
         cat_name = p.category_rel.name if p.category_rel else 'OTHER'
         sub_name = p.sub_category_rel.name if p.sub_category_rel else 'GENERAL'
         cat_orders[cat_name] = (p.category_rel.display_order or 0) if p.category_rel else 9999
