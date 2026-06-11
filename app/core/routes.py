@@ -2386,14 +2386,17 @@ from sqlalchemy import func
 def get_categories():
     active_dept = get_active_department()
     
-    # 👇 THE TRUE RUTHLESS FIX: Block the request if context is missing
     if not active_dept:
         return jsonify({"error": "Department context missing. Cannot fetch categories."}), 400
     
-    # 1. Fetch ONLY categories for this specific department
+    # 1. Fetch categories
     cats = Category.query.filter_by(is_active=True, department_id=active_dept).order_by(Category.display_order.asc(), Category.id.asc()).all()
     
-    # 2. Make sure we only scan products in this department
+    # 2. Fetch all sub-categories so we can sort deterministically
+    all_subs = SubCategory.query.filter_by(is_active=True, department_id=active_dept).all()
+    sub_map = {str(s.id): s for s in all_subs}
+
+    # 3. Find active links
     active_pairs = db.session.query(Product.category_id, Product.sub_category_id)\
         .filter(Product.is_active == True, Product.department_id == active_dept)\
         .distinct().all()
@@ -2411,8 +2414,10 @@ def get_categories():
         sub_orders_query = CategorySubOrder.query.filter_by(category_id=c.id).all()
         sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
         
-        dynamic_subs = used_subs_by_cat.get(c.id, set())
-       
+        # 🚨 THE FIX: Convert the random set to a list, and lock the sorting order!
+        dynamic_subs = list(used_subs_by_cat.get(c.id, set()))
+        dynamic_subs.sort(key=lambda sid: (sub_map[sid].display_order if sid in sub_map else 9999, int(sid)))
+        
         fallback_counter = 1000 
         for sid in dynamic_subs:
             if sid not in sub_orders_dict:
@@ -2427,8 +2432,6 @@ def get_categories():
         })
         
     return jsonify(result), 200
-
-
 @core.route('/sub-categories', methods=['GET'])
 @jwt_required
 def get_sub_categories():
@@ -2544,10 +2547,10 @@ def delete_category(cat_id):
     if not cat:
         return jsonify({"error": "Category not found"}), 404
         
-    # 🚨 FIX: Added is_active=True so recycle bin products don't block deletion
-    product_using_cat = Product.query.filter_by(category_id=cat_id, is_active=True).first()
-    if product_using_cat:
-        return jsonify({"error": "Cannot delete. There are active products currently assigned to this category."}), 400
+    # 🚨 THE FIX: Tell the Admin exactly which product is blocking the delete!
+    product_using = Product.query.filter_by(category_id=cat_id, is_active=True).first()
+    if product_using:
+        return jsonify({"error": f"Cannot delete. Product '{product_using.name}' (SKU: {product_using.product_code}) is still using this category."}), 400
 
     try:
         cat.is_active = False # Soft Delete
@@ -2565,10 +2568,10 @@ def delete_sub_category(sub_id):
     if not sub:
         return jsonify({"error": "Sub-Category not found"}), 404
         
-    # 🚨 FIX: Added is_active=True
-    product_using_sub = Product.query.filter_by(sub_category_id=sub_id, is_active=True).first()
-    if product_using_sub:
-        return jsonify({"error": "Cannot delete. There are active products currently assigned to this sub-category."}), 400
+    # 🚨 THE FIX: Tell the Admin exactly which product is blocking the delete!
+    product_using = Product.query.filter_by(sub_category_id=sub_id, is_active=True).first()
+    if product_using:
+        return jsonify({"error": f"Cannot delete. Product '{product_using.name}' (SKU: {product_using.product_code}) is still using this sub-category."}), 400
 
     try:
         sub.is_active = False # Soft Delete
@@ -2577,6 +2580,7 @@ def delete_sub_category(sub_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
+    
     
 @core.route('/sub-categories', methods=['POST'])
 @jwt_required
