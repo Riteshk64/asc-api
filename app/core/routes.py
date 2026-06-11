@@ -2412,9 +2412,12 @@ def get_categories():
         sub_orders_dict = {str(so.sub_category_id): so.display_order for so in sub_orders_query}
         
         dynamic_subs = used_subs_by_cat.get(c.id, set())
+       
+        fallback_counter = 1000 
         for sid in dynamic_subs:
             if sid not in sub_orders_dict:
-                sub_orders_dict[sid] = 999 
+                sub_orders_dict[sid] = fallback_counter 
+                fallback_counter += 1 
         
         result.append({
             "id": c.id, 
@@ -2534,7 +2537,6 @@ def add_category():
     db.session.commit()
     return jsonify({"message": "Category added successfully", "id": new_cat.id}), 201
 
-
 @core.route('/categories/<int:cat_id>', methods=['DELETE'])
 @jwt_required
 def delete_category(cat_id):
@@ -2542,20 +2544,40 @@ def delete_category(cat_id):
     if not cat:
         return jsonify({"error": "Category not found"}), 404
         
-    # 🛡️ THE SHIELD: Prevent deletion if ANY product is using it
-    product_using_cat = Product.query.filter_by(category_id=cat_id).first()
+    # 🚨 FIX: Added is_active=True so recycle bin products don't block deletion
+    product_using_cat = Product.query.filter_by(category_id=cat_id, is_active=True).first()
     if product_using_cat:
-        return jsonify({"error": "Cannot delete. There are products currently assigned to this category."}), 400
+        return jsonify({"error": "Cannot delete. There are active products currently assigned to this category."}), 400
 
     try:
-        cat.is_active = False # 👈 Soft Delete
+        cat.is_active = False # Soft Delete
         db.session.commit()
         return jsonify({"message": "Category moved to Recycle Bin"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Database error: {str(e)}"}), 500
-    
+        
 
+@core.route('/sub-categories/<int:sub_id>', methods=['DELETE'])
+@jwt_required
+def delete_sub_category(sub_id):
+    sub = SubCategory.query.get(sub_id)
+    if not sub:
+        return jsonify({"error": "Sub-Category not found"}), 404
+        
+    # 🚨 FIX: Added is_active=True
+    product_using_sub = Product.query.filter_by(sub_category_id=sub_id, is_active=True).first()
+    if product_using_sub:
+        return jsonify({"error": "Cannot delete. There are active products currently assigned to this sub-category."}), 400
+
+    try:
+        sub.is_active = False # Soft Delete
+        db.session.commit()
+        return jsonify({"message": "Sub-Category moved to Recycle Bin"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    
 @core.route('/sub-categories', methods=['POST'])
 @jwt_required
 def add_sub_category():
@@ -2598,25 +2620,6 @@ def fix_order_zeros():
     db.session.commit()
     return jsonify({"message": "All 0s have been replaced with sequential numbers!"}), 200
 
-@core.route('/sub-categories/<int:sub_id>', methods=['DELETE'])
-@jwt_required
-def delete_sub_category(sub_id):
-    sub = SubCategory.query.get(sub_id)
-    if not sub:
-        return jsonify({"error": "Sub-Category not found"}), 404
-        
-    # 🛡️ THE SHIELD: Prevent deletion if ANY product is using it
-    product_using_sub = Product.query.filter_by(sub_category_id=sub_id).first()
-    if product_using_sub:
-        return jsonify({"error": "Cannot delete. There are products currently assigned to this sub-category."}), 400
-
-    try:
-        sub.is_active = False # 👈 Soft Delete
-        db.session.commit()
-        return jsonify({"message": "Sub-Category moved to Recycle Bin"}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Database error: {str(e)}"}), 500
 
 @core.route('/products', methods=['POST'])
 @jwt_required
