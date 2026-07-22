@@ -895,8 +895,6 @@ def search_products():
     products = query.order_by(Product.name.asc()).limit(50).all()
     
     return jsonify([{"id": p.id, "name": p.name, "sku": p.product_code} for p in products]), 200
-
-
 @core.route('/products/<int:id>', methods=['PUT'])
 @jwt_required
 def update_product(id):
@@ -907,16 +905,28 @@ def update_product(id):
 
     data = request.get_json()
     try:
-        if 'name' in data: product.name = str(data['name']).strip()
-        if 'sku' in data: product.product_code = str(data['sku']).strip()
-        if 'min_stock' in data: product.min_stock = float(data['min_stock'])
-        if 'max_stock' in data: product.max_stock = float(data['max_stock'])
-        if 'pcs_per_box' in data: product.pcs_per_box = int(data['pcs_per_box'])
+        if 'name' in data and data['name']: 
+            product.name = str(data['name']).strip()
+        if 'sku' in data and data['sku']: 
+            product.product_code = str(data['sku']).strip()
+            
+        # 👇 FIX: Safely handle null or empty strings to prevent crashes
+        if 'min_stock' in data:
+            val = data['min_stock']
+            product.min_stock = float(val) if val not in [None, ""] else 0.0
+            
+        if 'max_stock' in data:
+            val = data['max_stock']
+            product.max_stock = float(val) if val not in [None, ""] else 0.0
+            
+        if 'pcs_per_box' in data:
+            val = data['pcs_per_box']
+            product.pcs_per_box = int(val) if val not in [None, ""] else 0
 
         # Update Category/Sub by name (namespaced by dept)
         for field, model in [('category_name', Category), ('sub_category_name', SubCategory)]:
             if field in data:
-                name = data[field].strip().upper() or ('OTHER' if field == 'category_name' else 'GENERAL')
+                name = data[field].strip().upper() if data[field] else ('OTHER' if field == 'category_name' else 'GENERAL')
                 obj = model.query.filter_by(name=name, department_id=active_dept).first()
                 if not obj:
                     max_ord = db.session.query(func.max(model.display_order)).filter_by(department_id=active_dept).scalar() or 0
@@ -932,7 +942,6 @@ def update_product(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "Update failed", "details": str(e)}), 500
-
 
 @core.route('/pending-users', methods=['GET'])
 @jwt_required
