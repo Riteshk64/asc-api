@@ -597,87 +597,61 @@ def get_products():
     product_ids = [p.id for p in products]
     product_map = {p.id: p for p in products}
 
-    # NO DATE FILTER: Dynamically calculate stock using ONLY active transactions to prevent bloat
-    if not start_str or not end_str:
-        # Fetch all active transactions for these products to compute true stock
-        live_transactions = Transaction.query.filter(
-            Transaction.is_active == True,
-            Transaction.department_id == active_dept,
-            Transaction.product_id.in_(product_ids)
-        ).all()
+    # Parse the optional date range up front (used below to scope total_stock_in/out)
+    start_date = end_date = None
+    if start_str and end_str:
+        try:
+            # Slice to [:10] to safely grab 'YYYY-MM-DD' ignoring any ISO timestamps
+            start_date = datetime.strptime(start_str[:10], '%Y-%m-%d')
+            end_date = datetime.strptime(end_str[:10], '%Y-%m-%d').replace(
+                hour=23, minute=59, second=59
+            )
+        except ValueError:
+            return jsonify({"error": "Invalid date format"}), 400
 
-        live_tallies = {pid: {'t_in': 0.0, 't_out': 0.0} for pid in product_ids}
-        for txn in live_transactions:
-            pid = txn.product_id
-            p = product_map[pid]
-            if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-                live_tallies[pid]['t_in'] = calculate_new_stock(
-                    live_tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
-                )
-            elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-                live_tallies[pid]['t_out'] = calculate_new_stock(
-                    live_tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
-                )
-
-        data = []
-        for p in products:
-            p_dict = p.to_dict()
-            eff_unit = get_effective_unit(p)
-            # Override stale shelf stock with mathematically verified active transaction stock
-            p_dict['qty'] = calculate_new_stock(live_tallies[p.id]['t_in'], live_tallies[p.id]['t_out'], eff_unit, is_adding=False)
-            p_dict['total_stock_in'] = None
-            p_dict['total_stock_out'] = None
-            data.append(p_dict)
-
-        return jsonify({
-            "data": data,
-            "pagination": {
-                "page": page, "per_page": per_page,
-                "total": pagination.total, "pages": pagination.pages
-            }
-        }), 200
-
-    # DATE FILTER ACTIVE: Query transactions within the bounding dates
-    # DATE FILTER ACTIVE: Query transactions within the bounding dates
-    try:
-        # Slice to [:10] to safely grab 'YYYY-MM-DD' ignoring any ISO timestamps 
-        start_date = datetime.strptime(start_str[:10], '%Y-%m-%d')
-        end_date = datetime.strptime(end_str[:10], '%Y-%m-%d').replace(
-            hour=23, minute=59, second=59
-        )
-    except ValueError:
-        return jsonify({"error": "Invalid date format"}), 400
-
-    transactions = Transaction.query.filter(
+    # Fetch all active transactions for these products to compute true stock.
+    # `qty` must always be derived from these (not the stale `current_stock` column),
+    # regardless of whether a date filter is active, so it stays consistent between views.
+    live_transactions = Transaction.query.filter(
         Transaction.is_active == True,
         Transaction.department_id == active_dept,
-        Transaction.product_id.in_(product_ids),
-        Transaction.created_at.between(start_date, end_date)
+        Transaction.product_id.in_(product_ids)
     ).all()
 
-    tallies = {pid: {'t_in': 0.0, 't_out': 0.0} 
-               for pid in product_ids}
+    live_tallies = {pid: {'t_in': 0.0, 't_out': 0.0} for pid in product_ids}
+    period_tallies = {pid: {'t_in': 0.0, 't_out': 0.0} for pid in product_ids}
 
-    for txn in transactions:
+    for txn in live_transactions:
         pid = txn.product_id
         p = product_map[pid]
+        in_period = start_date is not None and start_date <= txn.created_at <= end_date
 
         if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
-            tallies[pid]['t_in'] = calculate_new_stock(
-                tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
+            live_tallies[pid]['t_in'] = calculate_new_stock(
+                live_tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
             )
+            if in_period:
+                period_tallies[pid]['t_in'] = calculate_new_stock(
+                    period_tallies[pid]['t_in'], txn.quantity, p.unit, is_adding=True
+                )
         elif txn.type == 'out' or (txn.type == 'return' and txn.supplier_id):
-            tallies[pid]['t_out'] = calculate_new_stock(
-                tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
+            live_tallies[pid]['t_out'] = calculate_new_stock(
+                live_tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
             )
+            if in_period:
+                period_tallies[pid]['t_out'] = calculate_new_stock(
+                    period_tallies[pid]['t_out'], txn.quantity, p.unit, is_adding=True
+                )
 
+    date_filter_active = start_date is not None
     data = []
     for p in products:
-        # 🚨 FIX: Removed 'if not tallies[p.id]['moved']: continue'
-        # Excluding products here breaks the pagination counts and makes items vanish from the UI.
         p_dict = p.to_dict()
-        p_dict['total_stock_in'] = tallies[p.id]['t_in']
-        p_dict['total_stock_out'] = tallies[p.id]['t_out']
+        eff_unit = get_effective_unit(p)
+        # Override stale shelf stock with mathematically verified active transaction stock
+        p_dict['qty'] = calculate_new_stock(live_tallies[p.id]['t_in'], live_tallies[p.id]['t_out'], eff_unit, is_adding=False)
+        p_dict['total_stock_in'] = period_tallies[p.id]['t_in'] if date_filter_active else None
+        p_dict['total_stock_out'] = period_tallies[p.id]['t_out'] if date_filter_active else None
         data.append(p_dict)
 
     return jsonify({
