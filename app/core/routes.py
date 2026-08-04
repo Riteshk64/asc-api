@@ -638,9 +638,11 @@ def get_products():
         }), 200
 
     # DATE FILTER ACTIVE: Query transactions within the bounding dates
+    # DATE FILTER ACTIVE: Query transactions within the bounding dates
     try:
-        start_date = datetime.strptime(start_str, '%Y-%m-%d')
-        end_date = datetime.strptime(end_str, '%Y-%m-%d').replace(
+        # Slice to [:10] to safely grab 'YYYY-MM-DD' ignoring any ISO timestamps 
+        start_date = datetime.strptime(start_str[:10], '%Y-%m-%d')
+        end_date = datetime.strptime(end_str[:10], '%Y-%m-%d').replace(
             hour=23, minute=59, second=59
         )
     except ValueError:
@@ -653,13 +655,12 @@ def get_products():
         Transaction.created_at.between(start_date, end_date)
     ).all()
 
-    tallies = {pid: {'t_in': 0.0, 't_out': 0.0, 'moved': False} 
+    tallies = {pid: {'t_in': 0.0, 't_out': 0.0} 
                for pid in product_ids}
 
     for txn in transactions:
         pid = txn.product_id
         p = product_map[pid]
-        tallies[pid]['moved'] = True
 
         if txn.type == 'in' or (txn.type == 'return' and not txn.supplier_id):
             tallies[pid]['t_in'] = calculate_new_stock(
@@ -672,8 +673,8 @@ def get_products():
 
     data = []
     for p in products:
-        if not tallies[p.id]['moved']:
-            continue  # Exclude products with no activity in the date range
+        # 🚨 FIX: Removed 'if not tallies[p.id]['moved']: continue'
+        # Excluding products here breaks the pagination counts and makes items vanish from the UI.
         p_dict = p.to_dict()
         p_dict['total_stock_in'] = tallies[p.id]['t_in']
         p_dict['total_stock_out'] = tallies[p.id]['t_out']
