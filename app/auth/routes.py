@@ -1,3 +1,4 @@
+import os
 from flask import Blueprint, request, jsonify, current_app
 from app.auth.firebase import verify_firebase_token
 from app.auth.jwt_utils import generate_jwt
@@ -6,8 +7,6 @@ from app.extensions import db
 from app.models.department import Department
 from app.auth.jwt_middleware import jwt_required
 from flask import g
-from app.models.contractor import Contractor
-from app.models.supplier import Supplier
 
 auth = Blueprint('auth', __name__, url_prefix='/auth')
 
@@ -70,9 +69,6 @@ def get_current_user():
 
 
 
-from app.models.contractor import Contractor
-from app.models.supplier import Supplier
-
 @auth.route("/verify-phone", methods=["POST"])
 def verify_phone():
     data = request.get_json()
@@ -89,38 +85,34 @@ def verify_phone():
     except Exception as e:
         return jsonify({"success": False, "message": "Invalid Firebase Token"}), 401
 
+    # 🔒 SOLE-ACCOUNT LOCKDOWN: only the number configured via the AUTHORIZED_PHONE
+    # env var (kept out of source control, see .env) may ever log in. Everyone else
+    # is rejected here, before any user record is looked up or created.
+    authorized_phone = (os.environ.get("AUTHORIZED_PHONE") or "").strip()
+    if not authorized_phone or str(phone or "").strip() != authorized_phone:
+        return jsonify({"success": False, "message": "This app is restricted to an authorized account."}), 403
+
     user = User.query.filter_by(phoneno=phone).first()
 
     if not user:
-        existing_contractor = Contractor.query.filter_by(phone=phone).first()
-        existing_supplier = Supplier.query.filter_by(phone_number=phone).first()
-
-        if existing_contractor:
-            user = User(
-                first_name=existing_contractor.name, phoneno=phone, role='CLIENT',
-                department_id=existing_contractor.department_id, is_active=False,
-                approval_status='PENDING_SIGNUP', 
-                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
-            )
-        elif existing_supplier:
-            user = User(
-                first_name=existing_supplier.name, phoneno=phone, role='SUPPLIER',
-                department_id=existing_supplier.department_id, is_active=False,
-                approval_status='PENDING_SIGNUP', 
-                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
-            )
-        else:
-            user = User(
-                phoneno=phone, is_active=False, role='USER',  
-                approval_status='PENDING_SIGNUP', 
-                trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
-            )
-            
+        user = User(
+            phoneno=phone, first_name="Admin", role='ADMIN', is_active=True,
+            approval_status='APPROVED',
+            trusted_devices=str(device_id).strip(), trusted_device_names=str(device_name).strip()
+        )
         db.session.add(user)
         db.session.commit()
     else:
+        # This is the one and only allowed account — always keep it fully
+        # provisioned (ADMIN / active / approved) regardless of prior state.
+        if user.role != 'ADMIN' or not user.is_active or user.approval_status != 'APPROVED':
+            user.role = 'ADMIN'
+            user.is_active = True
+            user.approval_status = 'APPROVED'
+            db.session.commit()
+
         # --- EXISTING USER LOGIN ATTEMPT ---
-        
+
         # 1. LEGACY DEVICE MIGRATOR (Safely removes None strings)
         old_device = str(user.device_id or "").strip()
         if old_device and old_device != "None" and not user.trusted_devices:
